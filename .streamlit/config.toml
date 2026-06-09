@@ -1,0 +1,16 @@
+# Soft dark theme — clean sans-serif, gentle cards, gold/teal accents.
+# Streamlit reads this automatically on launch (local + Community Cloud).
+
+[theme]
+base = "dark"
+primaryColor = "#e0b84c"            # warm gold — primary accents / active widgets
+backgroundColor = "#10141b"         # soft near-black (warmer than pure black)
+secondaryBackgroundColor = "#1a2029"  # panel / card background
+textColor = "#eaf0f6"               # soft off-white text
+font = "sans serif"                 # clean, consumer-app feel (not terminal)
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false

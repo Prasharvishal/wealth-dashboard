@@ -1,0 +1,8 @@
+wealth.db*
+wealth_replica.db*
+.venv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+.DS_Store
+.claude/
