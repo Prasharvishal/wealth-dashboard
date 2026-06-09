@@ -3,25 +3,25 @@ Storage layer for the Household Wealth Dashboard — durable across restarts.
 
 Two interchangeable backends, chosen automatically at runtime:
 
-  * **Turso (libSQL)** — used when TURSO_DATABASE_URL (+ TURSO_AUTH_TOKEN) is
+  * **Turso (libSQL)** over HTTP — used when TURSO_DATABASE_URL (+ token) is
     present in the environment or st.secrets. This is a hosted SQLite database,
-    so the data survives Streamlit Community Cloud's ephemeral filesystem. We
-    connect as an *embedded replica*: a small local file is kept in sync with
-    the remote primary, giving fast local reads while every write is durably
-    forwarded to the cloud.
+    so data survives Streamlit Community Cloud's ephemeral filesystem. We use
+    the pure-HTTP `libsql_client` (NOT an embedded replica), which is the right
+    fit for a serverless host: every query is a stateless request to the cloud
+    primary, so there's no local replica file and no blocking background sync.
 
   * **Local SQLite** — the zero-config default when no Turso credentials are
     set (i.e. running on your own Mac). Identical SQL, a plain `wealth.db` file.
 
-Because libSQL speaks the SQLite dialect, the schema and every query below are
-shared verbatim between the two backends. The only backend-specific bits are
-how a connection is opened (see `_get_conn`) and an optional `pull()` that
-refreshes the local replica from the cloud.
+Robustness: the Turso connection is attempted ONCE behind a hard timeout in a
+worker thread. If it can't establish within the timeout (or errors), we fall
+back to local SQLite and record the reason in `turso_error()` — the app shows a
+warning but NEVER hangs at startup. (An earlier embedded-replica approach hung
+on Streamlit Cloud during its startup sync; this design makes that impossible.)
 
-Row access is backend-neutral: we never rely on `sqlite3.Row`; instead every
-read goes through `_rows()` which zips `cursor.description` with the tuples to
-produce plain dicts. That keeps the public API (list[dict] / dict / scalars)
-identical no matter which backend is live.
+Row access is backend-neutral: reads return plain dicts (built from column
+names), so the public API (list[dict] / dict / scalars) is identical no matter
+which backend is live.
 """
 
 import os
@@ -29,13 +29,7 @@ import sqlite3
 import threading
 from datetime import datetime
 
-# Quiet the libSQL Rust layer's connection-retry logging — failures are already
-# surfaced cleanly in-app via turso_error(). Set before any libsql import.
-os.environ.setdefault("RUST_LOG", "off")
-
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wealth.db")
-# Local replica file used only in Turso mode (synced with the cloud primary).
-REPLICA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wealth_replica.db")
 
 # The locked target allocation (growth sleeve). Seeded on first launch.
 TARGET_ALLOCATION = [
@@ -72,10 +66,11 @@ DEFAULT_SETTINGS = {
 # ---------------------------------------------------------------------------
 # Backend selection + connection management
 # ---------------------------------------------------------------------------
-_LOCK = threading.Lock()        # serialise access (2-user app; cheap insurance)
-_BACKEND = None                 # 'turso' | 'sqlite' — resolved once, lazily
-_TURSO_CONN = None              # cached embedded-replica connection (Turso only)
-_TURSO_ERROR = None             # human-readable reason Turso fell back, if any
+_LOCK = threading.Lock()            # serialise access (2-user app)
+_BACKEND = None                     # 'turso' | 'sqlite' — resolved once
+_TURSO_CLIENT = None                # cached libsql_client HTTP client
+_TURSO_ERROR = None                 # human-readable reason Turso fell back
+_TURSO_CONNECT_TIMEOUT = 10         # seconds — hard cap so startup can't hang
 
 
 def _turso_creds():
@@ -92,8 +87,31 @@ def _turso_creds():
     return url, token
 
 
+def _http_url(url):
+    """libsql_client wants an http(s)/ws(s) URL; map the libsql:// scheme."""
+    if url.startswith("libsql://"):
+        return "https://" + url[len("libsql://"):]
+    return url
+
+
+def _try_connect_turso():
+    """Create the HTTP client and force one real round-trip. Raises on failure."""
+    global _TURSO_CLIENT
+    import libsql_client
+    url, token = _turso_creds()
+    client = libsql_client.create_client_sync(url=_http_url(url), auth_token=token)
+    client.execute("SELECT 1")  # prove the connection actually works
+    _TURSO_CLIENT = client
+    return client
+
+
 def _resolve_backend():
-    """Decide once whether we're on Turso or local SQLite."""
+    """Decide once whether we're on Turso or local SQLite.
+
+    The Turso attempt runs in a worker thread with a hard timeout: if it can't
+    connect in time it's abandoned and we fall back to local SQLite, so the
+    startup path can never block on a slow/hung network call.
+    """
     global _BACKEND, _TURSO_ERROR
     if _BACKEND is not None:
         return _BACKEND
@@ -101,45 +119,34 @@ def _resolve_backend():
     if not url:
         _BACKEND = "sqlite"
         return _BACKEND
-    # Turso creds present — try to stand up an embedded-replica connection.
-    try:
-        _open_turso()
+
+    # Attempt the connect in a DAEMON thread bounded by a join timeout. A daemon
+    # thread can never delay process shutdown, and join() returning early means
+    # a slow/hung connect simply yields a local-SQLite fallback instead of a hang.
+    result = {}
+
+    def _worker():
+        try:
+            _try_connect_turso()
+            result["ok"] = True
+        except Exception as e:
+            result["err"] = f"{type(e).__name__}: {e}"[:300]
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(_TURSO_CONNECT_TIMEOUT)
+
+    if result.get("ok"):
         _BACKEND = "turso"
-    except Exception as e:
-        # Never crash: degrade to local SQLite and remember why.
-        _TURSO_ERROR = f"{type(e).__name__}: {e}"
+    else:
+        _TURSO_ERROR = result.get("err") or f"connect timed out after {_TURSO_CONNECT_TIMEOUT}s"
         _BACKEND = "sqlite"
     return _BACKEND
 
 
-def _open_turso():
-    """Open (and cache) the embedded-replica libSQL connection.
-
-    Embedded replica = a local file (REPLICA_PATH) kept in sync with the remote
-    Turso primary. Reads are served locally; writes are forwarded to the cloud
-    so they persist across restarts. We sync() once on open to pull the latest.
-    """
-    global _TURSO_CONN
-    if _TURSO_CONN is not None:
-        return _TURSO_CONN
-    url, token = _turso_creds()
-    import libsql_experimental as libsql  # Rust-backed; wheels on Linux+macOS
-    conn = libsql.connect(REPLICA_PATH, sync_url=url, auth_token=token)
-    conn.sync()  # pull latest from the cloud primary into the local replica
-    _TURSO_CONN = conn
-    return conn
-
-
-def _get_conn():
-    """Return a live connection for the active backend.
-
-    Local SQLite: a fresh short-lived connection per call (cheap; closed by the
-    caller helpers). Turso: the cached embedded-replica connection.
-    """
-    if _resolve_backend() == "turso":
-        return _open_turso()
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    return conn
+def _get_sqlite():
+    """A fresh local SQLite connection (caller closes it)."""
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
 def backend_name():
@@ -154,36 +161,27 @@ def turso_error():
 
 
 def pull():
-    """Refresh the local replica from the cloud (no-op on local SQLite).
-
-    Call once at the top of each Streamlit run so reads reflect writes made by
-    the other user on a different device.
-    """
-    if _resolve_backend() == "turso":
-        with _LOCK:
-            try:
-                _open_turso().sync()
-            except Exception:
-                pass  # transient network hiccup — serve last-synced data
+    """No-op. Kept for API compatibility — the HTTP client is always fresh
+    (every read hits the cloud primary directly, so there's nothing to sync)."""
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Backend-neutral query helpers (manual dict rows — no sqlite3.Row dependency)
+# Backend-neutral query helpers (return plain dict rows from either backend)
 # ---------------------------------------------------------------------------
-def _rows(cur):
-    cols = [d[0] for d in cur.description] if cur.description else []
-    return [dict(zip(cols, r)) for r in cur.fetchall()]
-
-
 def query(sql, params=()):
     """Run a SELECT, return list[dict]."""
     with _LOCK:
-        conn = _get_conn()
+        if _resolve_backend() == "turso":
+            rs = _TURSO_CLIENT.execute(sql, list(params))
+            cols = list(rs.columns)
+            return [{cols[i]: row[i] for i in range(len(cols))} for row in rs.rows]
+        conn = _get_sqlite()
         cur = conn.cursor()
         cur.execute(sql, params)
-        out = _rows(cur)
-        if _BACKEND == "sqlite":
-            conn.close()
+        cols = [d[0] for d in cur.description] if cur.description else []
+        out = [dict(zip(cols, r)) for r in cur.fetchall()]
+        conn.close()
         return out
 
 
@@ -195,37 +193,43 @@ def query_one(sql, params=()):
 def query_scalar(sql, params=()):
     """Run a SELECT returning a single value (e.g. COUNT(*))."""
     with _LOCK:
-        conn = _get_conn()
+        if _resolve_backend() == "turso":
+            rs = _TURSO_CLIENT.execute(sql, list(params))
+            return rs.rows[0][0] if rs.rows else None
+        conn = _get_sqlite()
         cur = conn.cursor()
         cur.execute(sql, params)
         row = cur.fetchone()
-        if _BACKEND == "sqlite":
-            conn.close()
+        conn.close()
         return row[0] if row else None
 
 
 def execute(sql, params=()):
     """Run a single write (INSERT/UPDATE/DELETE/DDL) and commit."""
     with _LOCK:
-        conn = _get_conn()
+        if _resolve_backend() == "turso":
+            _TURSO_CLIENT.execute(sql, list(params))  # HTTP autocommits
+            return
+        conn = _get_sqlite()
         cur = conn.cursor()
         cur.execute(sql, params)
         conn.commit()
-        if _BACKEND == "sqlite":
-            conn.close()
+        conn.close()
 
 
 def executemany(sql, seq):
-    """Run a write across many parameter tuples. Implemented as a loop so it is
-    portable across both backends regardless of cursor.executemany support."""
+    """Run a write across many parameter tuples (looped for backend portability)."""
     with _LOCK:
-        conn = _get_conn()
+        if _resolve_backend() == "turso":
+            for params in seq:
+                _TURSO_CLIENT.execute(sql, list(params))
+            return
+        conn = _get_sqlite()
         cur = conn.cursor()
         for params in seq:
             cur.execute(sql, params)
         conn.commit()
-        if _BACKEND == "sqlite":
-            conn.close()
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
