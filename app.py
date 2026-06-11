@@ -29,7 +29,7 @@ from fi_engine import FIInputs, project, run_scenarios
 # Page config + DB bootstrap
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="MAVI Wealth — FIRE Dashboard",
+    page_title="MAVI Vault — FIRE Dashboard",
     page_icon="💰",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -287,7 +287,7 @@ def check_auth():
     except Exception:
         expected = "fire2026"  # local-dev default; override via secrets on deploy
 
-    st.markdown("## 💰 MAVI Wealth")
+    st.markdown("## 💰 MAVI Vault")
     st.caption("Shared FIRE tracker — enter the household passcode to continue.")
     with st.form("login"):
         who = st.selectbox("Who's viewing?", ["Partner A (30)", "Partner B (28)"])
@@ -343,7 +343,7 @@ fi_inp = FIInputs(
 base_result = project(fi_inp)  # 10% baseline-ish (uses stored return default)
 total_net_worth = net_worth_growth + fi_inp.pf_current + fi_inp.nps_current
 
-st.markdown(f"#### 💰 MAVI Wealth  ·  *{st.session_state.get('user','')}*")
+st.markdown(f"#### 💰 MAVI Vault  ·  *{st.session_state.get('user','')}*")
 if any_stale:
     st.markdown(
         "<span class='stale-flag'>⚠ Some prices are stale (last-fetch fallback in use). "
