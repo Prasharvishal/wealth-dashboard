@@ -196,7 +196,8 @@ def compute_holdings_table():
 def sleeve_breakdown(df):
     """Current value per sleeve + target % comparison. Returns DataFrame."""
     targets = dict(db.get_target_allocation())
-    total = df["Value"].sum() if not df.empty else 0.0
+    # Growth/investable total = target sleeves only; Debt/Safety etc. sit outside.
+    total = (df.loc[df["Sleeve"].isin(targets), "Value"].sum() if not df.empty else 0.0)
     data = []
     for sleeve, tgt in db.get_target_allocation():
         cur_val = df.loc[df["Sleeve"] == sleeve, "Value"].sum() if not df.empty else 0.0
@@ -341,7 +342,10 @@ fi_inp = FIInputs(
     swr_pct=s_float("swr_pct", 3.5),
 )
 base_result = project(fi_inp)  # 10% baseline-ish (uses stored return default)
-total_net_worth = net_worth_growth + fi_inp.pf_current + fi_inp.nps_current
+_tgt_sleeves = dict(db.get_target_allocation())
+safety_value = (holdings_df.loc[~holdings_df["Sleeve"].isin(_tgt_sleeves), "Value"].sum()
+                if not holdings_df.empty else 0.0)
+total_net_worth = net_worth_growth + safety_value + fi_inp.pf_current + fi_inp.nps_current
 
 st.markdown(f"#### 💰 MAVI Vault  ·  *{st.session_state.get('user','')}*")
 if any_stale:
@@ -572,6 +576,8 @@ with tab1:
     c3.metric("Debt Layer (PF+NPS)", fmt_inr(fi_inp.pf_current + fi_inp.nps_current))
 
     st.markdown("##### Allocation — current vs target (growth sleeve)")
+    st.caption(f"🛡 Safety floor outside these targets (FDs, EPF, chits, post office): "
+               f"{fmt_inr(safety_value)}  ·  Household total: {fmt_inr(total_net_worth)}")
     left, right = st.columns([1, 1])
 
     with left:
@@ -884,12 +890,40 @@ with tab4:
 # TAB 5 — GOALS & REBALANCE
 # ===========================================================================
 with tab5:
+    st.markdown("##### 📋 Suggestions — rule-based, from live data")
+    if net_worth_growth > 0:
+        _tips = []
+        for _, _r in sleeve_df.iterrows():
+            _gap = _r["Target %"] - _r["Current %"]
+            _amt = _gap / 100.0 * net_worth_growth
+            if _gap >= 5:
+                _tips.append(f"**{_r['Sleeve']}** underweight ({_r['Current %']:.0f}% vs "
+                             f"{_r['Target %']:.0f}% target) → route the next "
+                             f"{fmt_inr(_amt)} of fresh money here first.")
+            elif _gap <= -5:
+                _x = (" Follow the monthly Direct-Stocks review — no ad-hoc sells."
+                      if _r["Sleeve"] == "Direct Stocks" else
+                      " No new money; let growth elsewhere dilute it.")
+                _tips.append(f"**{_r['Sleeve']}** overweight ({_r['Current %']:.0f}% vs "
+                             f"{_r['Target %']:.0f}%).{_x}")
+        if safety_value > 0:
+            _tips.append(f"**Safety floor** {fmt_inr(safety_value)} sits outside growth "
+                         f"targets (by design). Any upcoming liquidity (chit exits, FD "
+                         f"maturities) should get a written destination *before* it lands.")
+        _tips.append("_Rules: cash-flow rebalancing (new money → underweight sleeves; "
+                     "selling = last resort) · 5% deviation band · Direct Stocks governed "
+                     "by the monthly rulebook review._")
+        for _t in _tips:
+            st.markdown(f"- {_t}")
+        st.divider()
     st.markdown("##### Goal progress")
     goals = db.get_goals()
     # Emergency fund is funded from cash; milestones tracked against net worth.
     for g in goals:
         if g["kind"] == "emergency":
             current = s_float("emergency_current", 0)
+        elif g["kind"] == "travel":
+            current = s_float("travel_current", 0)   # earmarked only — not net worth
         else:
             current = total_net_worth
         pct = min(current / g["target_amount"] * 100.0, 100.0) if g["target_amount"] else 0.0
