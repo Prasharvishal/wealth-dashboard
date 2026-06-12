@@ -48,7 +48,7 @@ MUTED = "#8b949e"
 SLEEVE_COLORS = {
     "Nifty 50 (core)": "#4f9cf9",
     "Nifty Next 50": "#2dd4bf",
-    "Direct Stocks": "#d4af37",
+    "Direct Stocks": "#f0883e",   # orange — was gold, too close to the Gold sleeve
     "Global / US": "#a371f7",
     "Gold": "#e3b341",
     "Crypto": "#f778ba",
@@ -226,6 +226,40 @@ def compute_holdings_table():
     return df, any_stale
 
 
+def market_context():
+    """Live 'cheap or expensive vs its own 200-day average' per sleeve.
+
+    Rows are pushed into Turso by MAVI Sentinel twice daily (06:05 / 17:15 IST)
+    from the same verified price feeds the watchers use. Informational ONLY:
+    it never reorders targets or overrides the allocation rules — it tells you
+    what kind of price you're paying when you deploy.
+    """
+    try:
+        return {r["sleeve"]: r for r in db.query("SELECT * FROM market_context")}
+    except Exception:
+        return {}
+
+
+def context_badge(mc, sleeve):
+    """One-line price-context sentence for a sleeve, or '' if no benchmark."""
+    r = mc.get(sleeve)
+    if not r or r.get("dist_sma") is None:
+        return ""
+    d = float(r["dist_sma"])
+    side = "below" if d < 0 else "above"
+    base = f"{r['benchmark']} is {abs(d):.0f}% {side} its 200-day average"
+    if d <= -15:
+        note = ("deep-discount zone vs its own history — your rupee buys more units, "
+                "but the downtrend is NOT repaired; deploy in tranches, never beyond target")
+    elif d < 0:
+        note = "slightly cheap vs its own history"
+    elif d <= 10:
+        note = "trend healthy; price near its long-term average"
+    else:
+        note = "extended above average — you pay up here; no urgency to chase"
+    return f" · 📊 {base} ({note})"
+
+
 def upcoming_events(df):
     """Date-aware money radar: maturities from holdings + the monthly review ritual.
 
@@ -380,6 +414,14 @@ expenses = cf.get("expenses", 0.0)
 income = investable + expenses  # income reconstructed from investable + spend
 savings_rate = (investable / income * 100.0) if income else 0.0
 
+# EPF balances live as holdings rows (sleeve "Debt / Safety"); auto-feed the FI
+# projection from them when the explicit pf_current setting is 0, so the PF
+# compounding engine works without double-entering the number anywhere.
+_epf_from_holdings = (
+    holdings_df.loc[holdings_df["Asset"].str.contains("EPF|Provident", case=False,
+                                                      na=False), "Value"].sum()
+    if not holdings_df.empty else 0.0)
+
 # Build FI inputs from persisted settings; current corpus = priced growth sleeve
 # unless the user has set an explicit current_corpus override (>0).
 fi_inp = FIInputs(
@@ -388,7 +430,7 @@ fi_inp = FIInputs(
     current_corpus=(s_float("current_corpus", 0) or net_worth_growth),
     monthly_contribution=s_float("monthly_contribution", 100000),
     contribution_stepup_pct=s_float("contribution_stepup_pct", 8.0),
-    pf_current=s_float("pf_current", 0),
+    pf_current=(s_float("pf_current", 0) or _epf_from_holdings),
     pf_monthly=s_float("pf_monthly", 37500),
     pf_stepup_pct=s_float("pf_stepup_pct", 5.0),
     pf_return_pct=s_float("pf_return_pct", 7.5),
@@ -410,8 +452,11 @@ transit_value = (_non_tgt.loc[_non_tgt["Sleeve"] == "Transit (redeploying)", "Va
                  if _non_tgt is not None and not _non_tgt.empty else 0.0)
 safety_value = ((_non_tgt["Value"].sum() if _non_tgt is not None and not _non_tgt.empty else 0.0)
                 - transit_value)
+# Household total: EPF already sits inside safety_value (holdings rows), so add
+# only the EXPLICIT pf/nps settings here — never the holdings-derived feed —
+# or EPF would be counted twice.
 total_net_worth = (net_worth_growth + safety_value + transit_value
-                   + fi_inp.pf_current + fi_inp.nps_current)
+                   + s_float("pf_current", 0) + s_float("nps_current", 0))
 
 st.markdown(
     f"""<div class="vault-hero"><span class="wm"><b>MAVI</b> VAULT</span>
@@ -428,7 +473,7 @@ if any_stale:
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Net Worth", fmt_inr(total_net_worth),
-          help="Priced growth sleeve + PF + NPS")
+          help="Growth sleeve + transit + safety floor (EPF, post office)")
 k2.metric("Savings Rate", f"{savings_rate:.0f}%",
           help="Investable ÷ (investable + expenses), latest month")
 k3.metric("FI Progress", f"{base_result.fi_progress_pct:.0f}%",
@@ -644,7 +689,9 @@ with tab1:
     c1, c2, c3 = st.columns(3)
     c1.metric("Total Net Worth", fmt_inr(total_net_worth))
     c2.metric("Growth Sleeve", fmt_inr(net_worth_growth))
-    c3.metric("Debt Layer (PF+NPS)", fmt_inr(fi_inp.pf_current + fi_inp.nps_current))
+    c3.metric("🛡 Safety Floor", fmt_inr(safety_value),
+              help="EPF (both of you) + post office — permanent, outside market plans. "
+                   "EPF also feeds the FI projection's PF engine automatically.")
 
     # Money timeline — the app taps your shoulder as dated events approach.
     _evs = [e for e in upcoming_events(holdings_df) if -3 <= e["days"] <= 140]
@@ -828,7 +875,9 @@ with tab3:
 
         st.markdown("**Debt layer** (projected separately from the growth sleeve)")
         d1, d2, d3 = st.columns(3)
-        pf_cur = d1.number_input("PF current (₹)", 0.0, value=s_float("pf_current", 0), step=50000.0)
+        pf_cur = d1.number_input("PF current (₹)", 0.0, value=s_float("pf_current", 0), step=50000.0,
+                                 help="Leave 0 if EPF is already a holdings row (Debt / Safety) — "
+                                      "it auto-feeds from there; setting both double-counts.")
         pf_mo = d2.number_input("PF monthly (₹)", 0.0, value=s_float("pf_monthly", 37500), step=2500.0)
         nps_cur = d3.number_input("NPS current (₹)", 0.0, value=s_float("nps_current", 0), step=50000.0)
         d4, d5 = st.columns(2)
@@ -1000,22 +1049,33 @@ with tab4:
 # TAB 5 — GOALS & REBALANCE
 # ===========================================================================
 with tab5:
-    st.markdown("##### 📋 Suggestions — rule-based, from live data")
+    st.markdown("##### 📋 Suggestions — rule-based, priority-ordered, from live data")
     if net_worth_growth > 0:
+        _mc = market_context()
         _tips = []
+        # Underweights first, ranked by rupee gap (biggest hole = Priority 1).
+        # The gap maths is itself price-responsive: when a sleeve's market falls,
+        # its current % shrinks and its gap (priority + ₹) grows automatically.
+        _unders, _overs = [], []
         for _, _r in sleeve_df.iterrows():
             _gap = _r["Target %"] - _r["Current %"]
             _amt = _gap / 100.0 * net_worth_growth
             if _gap >= 5:
-                _tips.append(f"**{_r['Sleeve']}** underweight ({_r['Current %']:.0f}% vs "
-                             f"{_r['Target %']:.0f}% target) → route the next "
-                             f"{fmt_inr(_amt)} of fresh money here first.")
+                _unders.append((_amt, _gap, _r))
             elif _gap <= -5:
-                _x = (" Follow the monthly Direct-Stocks review — no ad-hoc sells."
-                      if _r["Sleeve"] == "Direct Stocks" else
-                      " No new money; let growth elsewhere dilute it.")
-                _tips.append(f"**{_r['Sleeve']}** overweight ({_r['Current %']:.0f}% vs "
-                             f"{_r['Target %']:.0f}%).{_x}")
+                _overs.append((_gap, _r))
+        _unders.sort(key=lambda x: -x[0])
+        for _i, (_amt, _gap, _r) in enumerate(_unders, 1):
+            _tips.append(f"🎯 **Priority {_i} — {_r['Sleeve']}**: underweight "
+                         f"({_r['Current %']:.0f}% vs {_r['Target %']:.0f}% target) → "
+                         f"route the next {fmt_inr(_amt)} of fresh money here"
+                         f"{context_badge(_mc, _r['Sleeve'])}")
+        for _gap, _r in _overs:
+            _x = (" Follow the monthly Direct-Stocks review — no ad-hoc sells."
+                  if _r["Sleeve"] == "Direct Stocks" else
+                  " No new money; let growth elsewhere dilute it.")
+            _tips.append(f"**{_r['Sleeve']}** overweight ({_r['Current %']:.0f}% vs "
+                         f"{_r['Target %']:.0f}%).{_x}{context_badge(_mc, _r['Sleeve'])}")
         if transit_value > 0:
             _ft = net_worth_growth + transit_value
             _gaps = []
@@ -1044,6 +1104,40 @@ with tab5:
                      "by the monthly rulebook review._")
         for _t in _tips:
             st.markdown(f"- {_t}")
+        if _mc:
+            _upd = next(iter(_mc.values())).get("updated", "")
+            st.caption(f"📊 price context from MAVI Sentinel's verified feeds, {_upd} · "
+                       "informational only — targets and the 20% sleeve caps never move with it")
+        with st.expander("🛒 What exactly to buy, sleeve by sleeve (instruments + how)"):
+            st.markdown("""
+**Nifty 50 (core)** — one index fund, direct-growth plan: *UTI Nifty 50 Index Fund* or
+*Nippon Nifty 50 Index Fund* (via Groww/Coin/Dhan), or the ETF *NIFTYBEES* if you prefer
+exchange delivery. Lump or split over 2–3 weeks — either is fine at this size.
+
+**Nifty Next 50** — *ICICI Pru Nifty Next 50 Index Fund* or *UTI Next 50* direct-growth
+(ETF alternative: *JUNIORBEES*). Same buying mechanics as the core.
+
+**Direct Stocks** — ONLY through the monthly rulebook review (Codex 081): HOLD/SELL list
+first, BUYs only inside the 20% envelope. No ad-hoc buying because a stock "looks good".
+
+**Global / US** — paused while 45% vs 20% target. When it resumes: an S&P 500 index
+fund/FoF (e.g. *Motilal Oswal S&P 500*) is simpler than direct US stocks — no LRS
+paperwork, no 20% TCS on remittance, still dollar exposure. Tesla stays as-is.
+
+**Gold** — *GOLDBEES* ETF in the demat, or Sovereign Gold Bonds from the secondary
+market if yield-to-maturity looks fair (SGB adds 2.5%/yr interest, tax-free at maturity).
+
+**Crypto (5% sleeve, ~₹25k)** — **BTC only, spot only.** One coin: Bitcoin is the
+index of this asset class; everything else is higher-beta on top of it. Buy on an
+INR exchange (CoinDCX spot) or Delta spot — **never futures/leverage for the sleeve**.
+Split into 2–3 buys over a few weeks (it's −18% vs its 200-day; cheap can get cheaper).
+Tax truth: 30% flat on gains + 1% TDS, **no loss offset** — enter only what you'd
+hold for years. Log every buy here in Holdings (type `crypto`, ticker `BTC`).
+
+**Tactical / thematic (15%)** — your own theses (PSU, momentum funds, etc.). The one
+rule: a written entry reason + exit condition per position, reviewed monthly alongside
+the stocks.
+""")
         st.divider()
     st.markdown("##### Goal progress")
     goals = db.get_goals()
