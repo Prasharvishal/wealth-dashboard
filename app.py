@@ -221,6 +221,7 @@ def compute_holdings_table():
             "Source": source,
             "Age": prices.last_price_age(h),
             "Maturity": h.get("maturity_date"),
+            "Prov": h.get("maturity_provenance"),
         })
     df = pd.DataFrame(rows)
     return df, any_stale
@@ -241,7 +242,12 @@ def market_context():
 
 
 def context_badge(mc, sleeve):
-    """One-line price-context sentence for a sleeve, or '' if no benchmark."""
+    """One-line price-context sentence for a sleeve, or '' if no benchmark.
+
+    Wording is deliberately NEUTRAL (Codex 082 ruling): state position vs the
+    200-day average and trend state only — never imply cheap = attractive.
+    Sleeve gaps decide priority; this line is context, not a signal.
+    """
     r = mc.get(sleeve)
     if not r or r.get("dist_sma") is None:
         return ""
@@ -249,14 +255,13 @@ def context_badge(mc, sleeve):
     side = "below" if d < 0 else "above"
     base = f"{r['benchmark']} is {abs(d):.0f}% {side} its 200-day average"
     if d <= -15:
-        note = ("deep-discount zone vs its own history — your rupee buys more units, "
-                "but the downtrend is NOT repaired; deploy in tranches, never beyond target")
+        note = "trend weak / not repaired — deploy in tranches; the allocation cap still applies"
     elif d < 0:
-        note = "slightly cheap vs its own history"
+        note = "trend not repaired"
     elif d <= 10:
-        note = "trend healthy; price near its long-term average"
+        note = "trend intact"
     else:
-        note = "extended above average — you pay up here; no urgency to chase"
+        note = "well above its average — no urgency to add"
     return f" · 📊 {base} ({note})"
 
 
@@ -278,12 +283,13 @@ def upcoming_events(df):
             except Exception:
                 continue
             kind = "transit" if "Transit" in str(r["Sleeve"]) else "safety"
+            prov = r.get("Prov") if pd.notna(r.get("Prov")) else "estimated"
             ev.append({"name": r["Asset"], "value": r["Value"], "date": str(r["Maturity"]),
-                       "days": d, "kind": kind})
+                       "days": d, "kind": kind, "prov": prov})
     nm = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
     ev.append({"name": "Monthly Direct-Stocks review (10-min rulebook pass)",
                "value": 0, "date": nm.isoformat(), "days": (nm - today).days,
-               "kind": "ritual"})
+               "kind": "ritual", "prov": "confirmed"})
     ev.sort(key=lambda e: e["days"])
     return ev
 
@@ -455,8 +461,13 @@ safety_value = ((_non_tgt["Value"].sum() if _non_tgt is not None and not _non_tg
 # Household total: EPF already sits inside safety_value (holdings rows), so add
 # only the EXPLICIT pf/nps settings here — never the holdings-derived feed —
 # or EPF would be counted twice.
+# Codex 082 P1 guard: if BOTH sources exist (EPF holdings rows AND a pf_current
+# setting), net worth uses the holdings rows only and a blocking warning renders.
+_pf_setting = s_float("pf_current", 0)
+_pf_conflict = _epf_from_holdings > 0 and _pf_setting > 0
 total_net_worth = (net_worth_growth + safety_value + transit_value
-                   + s_float("pf_current", 0) + s_float("nps_current", 0))
+                   + (0.0 if _pf_conflict else _pf_setting)
+                   + s_float("nps_current", 0))
 
 st.markdown(
     f"""<div class="vault-hero"><span class="wm"><b>MAVI</b> VAULT</span>
@@ -469,6 +480,13 @@ if any_stale:
         "<span class='stale-flag'>⚠ Some prices are stale (last-fetch fallback in use). "
         "Pull-to-refresh / reload to retry.</span>",
         unsafe_allow_html=True,
+    )
+if _pf_conflict:
+    st.error(
+        f"🚫 **PF is entered twice** — as EPF holdings rows ({fmt_inr(_epf_from_holdings)}) "
+        f"AND as the FI setting 'PF current' ({fmt_inr(_pf_setting)}). Net worth is using the "
+        "holdings rows ONLY and ignoring the setting. Fix one: set 'PF current' to 0 in the "
+        "FI tab, or delete the EPF holdings rows. PF lives in ONE place, never both."
     )
 
 k1, k2, k3, k4 = st.columns(4)
@@ -699,18 +717,24 @@ with tab1:
         st.markdown("##### 🗓 Money timeline — what's coming up")
         _chips = ""
         for _e in _evs:
-            _u = "ev-u7" if _e["days"] <= 7 else ("ev-u30" if _e["days"] <= 30 else "ev-uX")
+            _est = _e.get("prov") == "estimated"
+            # estimated dates never get red/urgent styling (Codex 082)
+            _u = ("ev-u30" if _e["days"] <= 30 else "ev-uX") if _est else (
+                "ev-u7" if _e["days"] <= 7 else ("ev-u30" if _e["days"] <= 30 else "ev-uX"))
             _hint = {"transit": "lands → redeploy via landing plan",
                      "ritual": "10-min ritual · rulebook 081",
                      "safety": "matures (long horizon)"}[_e["kind"]]
-            _when = datetime.fromisoformat(_e["date"]).strftime("%d %b")
+            if _est:
+                _hint += " · date unconfirmed"
+            _when = (("est. " if _est else "")
+                     + datetime.fromisoformat(_e["date"]).strftime("%d %b"))
             _val = f"{fmt_inr(_e['value'])} · " if _e["value"] else ""
-            _chips += (f'<div class="ev-chip {_u}"><div class="d">{_e["days"]}'
+            _chips += (f'<div class="ev-chip {_u}"><div class="d">{"~" if _est else ""}{_e["days"]}'
                        f'<small>days · {_when}</small></div>'
                        f'<div class="n">{_e["name"][:58]}</div>'
                        f'<div class="h">{_val}{_hint}</div></div>')
         st.markdown(f'<div class="ev-row">{_chips}</div>', unsafe_allow_html=True)
-        _soon = [e for e in _evs if 0 <= e["days"] <= 7]
+        _soon = [e for e in _evs if 0 <= e["days"] <= 7 and e.get("prov") != "estimated"]
         if _soon:
             st.warning("🔔 " + "  ·  ".join(
                 f"**{e['name'][:48]}** — {e['days']} day{'s' if e['days'] != 1 else ''} away"
@@ -1028,9 +1052,10 @@ with tab4:
             cols = ["Asset", "Qty", "Buy", "Price", "Value", "Cost",
                     "P/L", "P/L %", "CAGR %", "Source", "Stale", "Age"]
             if view["Maturity"].notna().any():
-                view["Lands"] = view["Maturity"].map(
-                    lambda m: f"⏳ {(datetime.fromisoformat(str(m)).date() - datetime.now().date()).days}d"
-                    if pd.notna(m) and m else "—")
+                view["Lands"] = view.apply(
+                    lambda r: (f"⏳ {(datetime.fromisoformat(str(r['Maturity'])).date() - datetime.now().date()).days}d"
+                               + (" (est.)" if r.get("Prov") == "estimated" else ""))
+                    if pd.notna(r["Maturity"]) and r["Maturity"] else "—", axis=1)
                 cols.insert(1, "Lands")
             st.dataframe(view[cols], use_container_width=True, hide_index=True)
 
@@ -1090,7 +1115,9 @@ with tab5:
                     if e["kind"] == "transit" and e["days"] >= -3]
             _sched = "  \n".join(
                 f"  · **{e['name'][:46]}** {fmt_inr(e['value'])} — lands in "
-                f"**{e['days']}d** ({datetime.fromisoformat(e['date']).strftime('%d %b')})"
+                f"**{'~' if e.get('prov') == 'estimated' else ''}{e['days']}d** "
+                f"({'est. ' if e.get('prov') == 'estimated' else ''}"
+                f"{datetime.fromisoformat(e['date']).strftime('%d %b')})"
                 for e in _tev)
             _tips.append(f"⏳ **{fmt_inr(transit_value)} in transit**, each piece dated:  \n"
                          f"{_sched}  \n"
@@ -1107,37 +1134,56 @@ with tab5:
         if _mc:
             _upd = next(iter(_mc.values())).get("updated", "")
             st.caption(f"📊 price context from MAVI Sentinel's verified feeds, {_upd} · "
-                       "informational only — targets and the 20% sleeve caps never move with it")
+                       "The rules (Codex 082): events are reminders, not decisions · sleeve "
+                       "gaps decide priority, not price badges · badges are context only · "
+                       "PF lives in one place, never both.")
         with st.expander("🛒 What exactly to buy, sleeve by sleeve (instruments + how)"):
-            st.markdown("""
-**Nifty 50 (core)** — one index fund, direct-growth plan: *UTI Nifty 50 Index Fund* or
-*Nippon Nifty 50 Index Fund* (via Groww/Coin/Dhan), or the ETF *NIFTYBEES* if you prefer
-exchange delivery. Lump or split over 2–3 weeks — either is fine at this size.
-
-**Nifty Next 50** — *ICICI Pru Nifty Next 50 Index Fund* or *UTI Next 50* direct-growth
-(ETF alternative: *JUNIORBEES*). Same buying mechanics as the core.
-
-**Direct Stocks** — ONLY through the monthly rulebook review (Codex 081): HOLD/SELL list
-first, BUYs only inside the 20% envelope. No ad-hoc buying because a stock "looks good".
-
-**Global / US** — paused while 45% vs 20% target. When it resumes: an S&P 500 index
-fund/FoF (e.g. *Motilal Oswal S&P 500*) is simpler than direct US stocks — no LRS
-paperwork, no 20% TCS on remittance, still dollar exposure. Tesla stays as-is.
-
-**Gold** — *GOLDBEES* ETF in the demat, or Sovereign Gold Bonds from the secondary
-market if yield-to-maturity looks fair (SGB adds 2.5%/yr interest, tax-free at maturity).
-
-**Crypto (5% sleeve, ~₹25k)** — **BTC only, spot only.** One coin: Bitcoin is the
-index of this asset class; everything else is higher-beta on top of it. Buy on an
-INR exchange (CoinDCX spot) or Delta spot — **never futures/leverage for the sleeve**.
-Split into 2–3 buys over a few weeks (it's −18% vs its 200-day; cheap can get cheaper).
-Tax truth: 30% flat on gains + 1% TDS, **no loss offset** — enter only what you'd
-hold for years. Log every buy here in Holdings (type `crypto`, ticker `BTC`).
-
-**Tactical / thematic (15%)** — your own theses (PSU, momentum funds, etc.). The one
-rule: a written entry reason + exit condition per position, reviewed monthly alongside
-the stocks.
-""")
+            # Guidance is CONDITIONAL on live sleeve state (Codex 082): buy text is
+            # actionable only where the sleeve is underweight and inside its cap.
+            _guide = {
+                "Nifty 50 (core)": "One index fund, direct-growth plan: *UTI Nifty 50 "
+                    "Index Fund* or *Nippon Nifty 50 Index Fund* (via Groww/Coin/Dhan), "
+                    "or the ETF *NIFTYBEES* for exchange delivery. Lump or split over "
+                    "2–3 weeks — either is fine at this size.",
+                "Nifty Next 50": "*ICICI Pru Nifty Next 50 Index Fund* or *UTI Next 50* "
+                    "direct-growth (ETF alternative: *JUNIORBEES*). Same mechanics as the core.",
+                "Direct Stocks": "ONLY through the monthly rulebook review (Codex 081): "
+                    "HOLD/SELL list first, BUYs only inside the 20% envelope. No ad-hoc "
+                    "buying because a stock \"looks good\".",
+                "Global / US": "When this sleeve is open for money again: an S&P 500 "
+                    "index fund/FoF (e.g. *Motilal Oswal S&P 500*) is simpler than direct "
+                    "US stocks — no LRS paperwork, no 20% TCS on remittance, still dollar "
+                    "exposure. Tesla stays as-is.",
+                "Gold": "*GOLDBEES* ETF in the demat, or Sovereign Gold Bonds from the "
+                    "secondary market when yield-to-maturity is fair (SGB adds 2.5%/yr "
+                    "interest, tax-free at maturity).",
+                "Crypto": "**BTC only, spot only.** One coin: Bitcoin is the index of "
+                    "this asset class; everything else is higher-beta on top of it. INR "
+                    "exchange (CoinDCX spot) or Delta spot — **never futures/leverage "
+                    "for the sleeve**. BTC is currently below its 200-day average (trend "
+                    "not repaired) — split into 2–3 buys over a few weeks; the 5% cap "
+                    "applies regardless of price. Tax truth: 30% flat on gains + 1% TDS, "
+                    "**no loss offset** — enter only what you'd hold for years. Log every "
+                    "buy here in Holdings (type `crypto`, ticker `BTC`).",
+                "Tactical / thematic": "Your own theses (PSU, momentum funds, etc.). The "
+                    "one rule: a written entry reason + exit condition per position, "
+                    "reviewed monthly alongside the stocks.",
+            }
+            for _, _r in sleeve_df.iterrows():
+                _g = _guide.get(_r["Sleeve"])
+                if not _g:
+                    continue
+                _gap = _r["Target %"] - _r["Current %"]
+                if _gap >= 5:
+                    _st = "✅ underweight — new money welcome here"
+                elif _gap <= -5:
+                    _st = "⛔ overweight — NO new money; reference only"
+                else:
+                    _st = "⏸ at target — maintenance only"
+                st.markdown(f"**{_r['Sleeve']}** · {_st}  \n{_g}")
+            st.caption("Buy guidance is actionable ONLY where the sleeve is underweight "
+                       "and inside its cap. Sleeve gaps decide priority; price badges are "
+                       "context, not signals. (Codex 082)")
         st.divider()
     st.markdown("##### Goal progress")
     goals = db.get_goals()

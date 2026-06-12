@@ -248,11 +248,13 @@ def init_db():
         asset_name TEXT NOT NULL, sleeve TEXT NOT NULL, asset_type TEXT NOT NULL,
         ticker TEXT, quantity REAL NOT NULL, buy_price REAL NOT NULL,
         buy_date TEXT, manual_price REAL, last_price REAL, last_price_time TEXT,
-        maturity_date TEXT)""")
-    try:  # migration for DBs created before maturity_date existed
-        execute("ALTER TABLE holdings ADD COLUMN maturity_date TEXT")
-    except Exception:
-        pass  # column already present
+        maturity_date TEXT, maturity_provenance TEXT)""")
+    for _mig in ("ALTER TABLE holdings ADD COLUMN maturity_date TEXT",
+                 "ALTER TABLE holdings ADD COLUMN maturity_provenance TEXT"):
+        try:  # migrations for DBs created before these columns existed
+            execute(_mig)
+        except Exception:
+            pass  # column already present
     execute("""CREATE TABLE IF NOT EXISTS cashflow (
         id INTEGER PRIMARY KEY AUTOINCREMENT, month TEXT NOT NULL,
         investable REAL NOT NULL DEFAULT 0, expenses REAL NOT NULL DEFAULT 0,
