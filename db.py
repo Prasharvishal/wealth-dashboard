@@ -247,7 +247,12 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         asset_name TEXT NOT NULL, sleeve TEXT NOT NULL, asset_type TEXT NOT NULL,
         ticker TEXT, quantity REAL NOT NULL, buy_price REAL NOT NULL,
-        buy_date TEXT, manual_price REAL, last_price REAL, last_price_time TEXT)""")
+        buy_date TEXT, manual_price REAL, last_price REAL, last_price_time TEXT,
+        maturity_date TEXT)""")
+    try:  # migration for DBs created before maturity_date existed
+        execute("ALTER TABLE holdings ADD COLUMN maturity_date TEXT")
+    except Exception:
+        pass  # column already present
     execute("""CREATE TABLE IF NOT EXISTS cashflow (
         id INTEGER PRIMARY KEY AUTOINCREMENT, month TEXT NOT NULL,
         investable REAL NOT NULL DEFAULT 0, expenses REAL NOT NULL DEFAULT 0,
@@ -310,12 +315,13 @@ def get_holdings():
 
 
 def add_holding(asset_name, sleeve, asset_type, ticker, quantity, buy_price,
-                buy_date, manual_price=None):
+                buy_date, manual_price=None, maturity_date=None):
     execute("""INSERT INTO holdings
-        (asset_name, sleeve, asset_type, ticker, quantity, buy_price, buy_date, manual_price)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (asset_name, sleeve, asset_type, ticker, quantity, buy_price, buy_date,
+         manual_price, maturity_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (asset_name, sleeve, asset_type, ticker, quantity, buy_price,
-             buy_date, manual_price))
+             buy_date, manual_price, maturity_date))
 
 
 def update_holding(holding_id, **fields):

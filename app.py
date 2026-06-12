@@ -15,7 +15,7 @@ Module layout:
   app.py       — this file: auth gate, theme, 5 tabs, charts
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -71,23 +71,30 @@ INSTRUMENT_HINTS = {
 st.markdown(
     """
     <style>
-      .block-container {padding-top: 2.2rem; padding-bottom: 3rem; max-width: 1320px;}
+      .block-container {padding-top: 1.6rem; padding-bottom: 3rem; max-width: 1320px;}
       h1, h2, h3, h4, h5 {letter-spacing: -0.01em;}
-      /* KPI / metric cards: soft panels with a little lift */
+      /* KPI / metric cards: glass panels, gold hairline, gentle lift on hover */
       div[data-testid="stMetric"] {
-        background: linear-gradient(180deg,#1c232e 0%, #171d26 100%);
-        border: 1px solid #232c38; border-radius: 14px;
-        padding: 16px 18px; box-shadow: 0 1px 2px rgba(0,0,0,0.25);
+        background: linear-gradient(165deg,#1d2531 0%, #161c25 100%);
+        border: 1px solid #243040; border-top: 2px solid rgba(212,175,55,.45);
+        border-radius: 15px; padding: 16px 18px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+        transition: transform .18s ease, border-color .18s ease;
       }
-      [data-testid="stMetricValue"] {font-size: 1.7rem; font-weight: 600;}
-      [data-testid="stMetricLabel"] {color: #9aa7b4; font-weight: 500;}
-      /* Tabs: pill-style, easier to scan */
+      div[data-testid="stMetric"]:hover {transform: translateY(-2px); border-color:#3a4656;}
+      [data-testid="stMetricValue"] {font-size: 1.7rem; font-weight: 650;}
+      [data-testid="stMetricLabel"] {color: #9aa7b4; font-weight: 500; letter-spacing:.02em;}
+      /* Tabs: pill-style, gold active state */
       .stTabs [data-baseweb="tab-list"] {gap: 6px; flex-wrap: wrap; border-bottom: none;}
       .stTabs [data-baseweb="tab"] {
         background:#1a2029; border-radius: 10px; padding: 8px 14px;
-        font-weight: 500;
+        font-weight: 500; border:1px solid transparent;
       }
-      .stTabs [aria-selected="true"] {background:#2a3340 !important; color:#e0b84c !important;}
+      .stTabs [aria-selected="true"] {
+        background:linear-gradient(160deg,#2c3543,#252e3a) !important;
+        color:#e0b84c !important; border:1px solid rgba(212,175,55,.35) !important;
+        box-shadow: 0 0 14px rgba(212,175,55,.08);
+      }
       /* Buttons: rounder, friendlier */
       .stButton button, .stForm button {border-radius: 10px; font-weight: 600;}
       /* Inputs: softer corners */
@@ -96,6 +103,31 @@ st.markdown(
       .step-pill {display:inline-block; background:#2a3340; color:#e0b84c;
         border-radius:999px; padding:2px 12px; font-size:0.8rem; font-weight:600;
         margin-bottom:6px;}
+      /* Progress bars: gold gradient */
+      .stProgress > div > div > div > div {
+        background: linear-gradient(90deg,#d4af37,#3fb950); border-radius: 6px;
+      }
+      /* Hero wordmark */
+      .vault-hero {display:flex; align-items:baseline; gap:14px; flex-wrap:wrap;
+        padding: 2px 0 10px; border-bottom:1px solid rgba(255,255,255,.06); margin-bottom:14px;}
+      .vault-hero .wm {font-size:1.55rem; font-weight:750; letter-spacing:.14em;}
+      .vault-hero .wm b {color:#d4af37;}
+      .vault-hero .sub {color:#8b949e; font-size:.78rem; letter-spacing:.22em;
+        text-transform:uppercase;}
+      .vault-hero .who {margin-left:auto; color:#8b949e; font-size:.82rem;
+        background:#1a2029; border:1px solid #243040; border-radius:999px; padding:3px 14px;}
+      /* Money-timeline event chips */
+      .ev-row {display:flex; gap:10px; overflow-x:auto; padding:6px 0 10px;}
+      .ev-chip {min-width:185px; background:linear-gradient(165deg,#1d2531,#161c25);
+        border:1px solid #243040; border-radius:13px; padding:11px 14px; flex-shrink:0;}
+      .ev-chip .d {font-size:1.25rem; font-weight:700; font-variant-numeric:tabular-nums;}
+      .ev-chip .d small {font-size:.68rem; color:#8b949e; font-weight:400; margin-left:5px;}
+      .ev-chip .n {font-size:.78rem; line-height:1.35; margin-top:3px; color:#c9d1d9;}
+      .ev-chip .h {font-size:.7rem; color:#8b949e; margin-top:2px;}
+      .ev-u7  {border-color:rgba(248,81,73,.55); box-shadow:0 0 14px rgba(248,81,73,.12);}
+      .ev-u7  .d {color:#f85149;}
+      .ev-u30 {border-color:rgba(227,179,65,.5);} .ev-u30 .d {color:#e3b341;}
+      .ev-uX  .d {color:#4f9cf9;}
       @media (max-width: 640px) {.block-container {padding-left:0.6rem; padding-right:0.6rem;}}
     </style>
     """,
@@ -188,9 +220,38 @@ def compute_holdings_table():
             "Stale": stale,
             "Source": source,
             "Age": prices.last_price_age(h),
+            "Maturity": h.get("maturity_date"),
         })
     df = pd.DataFrame(rows)
     return df, any_stale
+
+
+def upcoming_events(df):
+    """Date-aware money radar: maturities from holdings + the monthly review ritual.
+
+    Returns a list of dicts sorted by days-to-event. 'kind' drives styling:
+    transit = money landing for redeployment, safety = long-horizon maturity,
+    ritual = recurring process date.
+    """
+    ev = []
+    today = datetime.now().date()
+    if not df.empty and "Maturity" in df.columns:
+        for _, r in df.iterrows():
+            if not r.get("Maturity"):
+                continue
+            try:
+                d = (datetime.fromisoformat(str(r["Maturity"])).date() - today).days
+            except Exception:
+                continue
+            kind = "transit" if "Transit" in str(r["Sleeve"]) else "safety"
+            ev.append({"name": r["Asset"], "value": r["Value"], "date": str(r["Maturity"]),
+                       "days": d, "kind": kind})
+    nm = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
+    ev.append({"name": "Monthly Direct-Stocks review (10-min rulebook pass)",
+               "value": 0, "date": nm.isoformat(), "days": (nm - today).days,
+               "kind": "ritual"})
+    ev.sort(key=lambda e: e["days"])
+    return ev
 
 
 def sleeve_breakdown(df):
@@ -352,7 +413,12 @@ safety_value = ((_non_tgt["Value"].sum() if _non_tgt is not None and not _non_tg
 total_net_worth = (net_worth_growth + safety_value + transit_value
                    + fi_inp.pf_current + fi_inp.nps_current)
 
-st.markdown(f"#### 💰 MAVI Vault  ·  *{st.session_state.get('user','')}*")
+st.markdown(
+    f"""<div class="vault-hero"><span class="wm"><b>MAVI</b> VAULT</span>
+    <span class="sub">Household Wealth Engine</span>
+    <span class="who">👤 {st.session_state.get('user','')}</span></div>""",
+    unsafe_allow_html=True,
+)
 if any_stale:
     st.markdown(
         "<span class='stale-flag'>⚠ Some prices are stale (last-fetch fallback in use). "
@@ -579,6 +645,29 @@ with tab1:
     c1.metric("Total Net Worth", fmt_inr(total_net_worth))
     c2.metric("Growth Sleeve", fmt_inr(net_worth_growth))
     c3.metric("Debt Layer (PF+NPS)", fmt_inr(fi_inp.pf_current + fi_inp.nps_current))
+
+    # Money timeline — the app taps your shoulder as dated events approach.
+    _evs = [e for e in upcoming_events(holdings_df) if -3 <= e["days"] <= 140]
+    if _evs:
+        st.markdown("##### 🗓 Money timeline — what's coming up")
+        _chips = ""
+        for _e in _evs:
+            _u = "ev-u7" if _e["days"] <= 7 else ("ev-u30" if _e["days"] <= 30 else "ev-uX")
+            _hint = {"transit": "lands → redeploy via landing plan",
+                     "ritual": "10-min ritual · rulebook 081",
+                     "safety": "matures (long horizon)"}[_e["kind"]]
+            _when = datetime.fromisoformat(_e["date"]).strftime("%d %b")
+            _val = f"{fmt_inr(_e['value'])} · " if _e["value"] else ""
+            _chips += (f'<div class="ev-chip {_u}"><div class="d">{_e["days"]}'
+                       f'<small>days · {_when}</small></div>'
+                       f'<div class="n">{_e["name"][:58]}</div>'
+                       f'<div class="h">{_val}{_hint}</div></div>')
+        st.markdown(f'<div class="ev-row">{_chips}</div>', unsafe_allow_html=True)
+        _soon = [e for e in _evs if 0 <= e["days"] <= 7]
+        if _soon:
+            st.warning("🔔 " + "  ·  ".join(
+                f"**{e['name'][:48]}** — {e['days']} day{'s' if e['days'] != 1 else ''} away"
+                for e in _soon))
 
     st.markdown("##### Allocation — current vs target (growth sleeve)")
     st.caption(f"🛡 Permanent safety floor (EPF, post office): {fmt_inr(safety_value)}  ·  "
@@ -829,7 +918,11 @@ with tab4:
     with st.form("add_holding"):
         h1, h2, h3 = st.columns(3)
         name = h1.text_input("Asset name", placeholder="e.g. Parag Parikh Flexi Cap")
-        sleeve = h2.selectbox("Sleeve", db.SLEEVES)
+        sleeve = h2.selectbox(
+            "Sleeve", list(db.SLEEVES) + ["Transit (redeploying)", "Debt / Safety"],
+            help="Transit = money with a landing date you'll redeploy (chits, short FDs). "
+                 "Debt / Safety = permanent floor (EPF, post office) outside growth targets.",
+        )
         atype = h3.selectbox(
             "Type", ["mf", "stock", "global", "crypto", "manual"],
             help="mf=AMFI NAV · stock=yfinance .NS · global=yfinance USD→INR · "
@@ -840,15 +933,21 @@ with tab4:
                                placeholder="122639 / RELIANCE.NS / VOO / BTC")
         qty = h5.number_input("Quantity / units", min_value=0.0, step=1.0, format="%.4f")
         buy_price = h6.number_input("Buy price (₹)", min_value=0.0, step=1.0)
-        h7, h8 = st.columns(2)
+        h7, h8, h9 = st.columns(3)
         buy_date = h7.date_input("Buy date", value=datetime.now())
         manual_price = h8.number_input("Manual price override (₹, 0 = auto)",
                                        min_value=0.0, step=1.0)
+        maturity = h9.date_input(
+            "Maturity / landing date (optional)", value=None,
+            help="FDs, chits, bonds: when the money lands. Drives the Money "
+                 "timeline + approaching alerts.",
+        )
         if st.form_submit_button("Add holding", use_container_width=True):
             if name and qty > 0:
                 db.add_holding(
                     name, sleeve, atype, ticker.strip(), qty, buy_price,
                     str(buy_date), manual_price if manual_price > 0 else None,
+                    str(maturity) if maturity else None,
                 )
                 st.success(f"Added {name}.")
                 st.rerun()
@@ -859,7 +958,9 @@ with tab4:
     if holdings_df.empty:
         st.info("No holdings yet.")
     else:
-        for sleeve in db.SLEEVES:
+        _extra_sleeves = sorted(s for s in holdings_df["Sleeve"].unique()
+                                if s not in db.SLEEVES)
+        for sleeve in list(db.SLEEVES) + _extra_sleeves:
             sdf = holdings_df[holdings_df["Sleeve"] == sleeve]
             if sdf.empty:
                 continue
@@ -875,11 +976,14 @@ with tab4:
             view["CAGR %"] = view["CAGR %"].map(
                 lambda v: f"{v:+.1f}%" if pd.notna(v) else "—")
             view["Stale"] = view["Stale"].map(lambda v: "⚠" if v else "")
-            st.dataframe(
-                view[["Asset", "Qty", "Buy", "Price", "Value", "Cost",
-                      "P/L", "P/L %", "CAGR %", "Source", "Stale", "Age"]],
-                use_container_width=True, hide_index=True,
-            )
+            cols = ["Asset", "Qty", "Buy", "Price", "Value", "Cost",
+                    "P/L", "P/L %", "CAGR %", "Source", "Stale", "Age"]
+            if view["Maturity"].notna().any():
+                view["Lands"] = view["Maturity"].map(
+                    lambda m: f"⏳ {(datetime.fromisoformat(str(m)).date() - datetime.now().date()).days}d"
+                    if pd.notna(m) and m else "—")
+                cols.insert(1, "Lands")
+            st.dataframe(view[cols], use_container_width=True, hide_index=True)
 
         del_id = st.selectbox(
             "Delete a holding",
@@ -922,8 +1026,15 @@ with tab5:
             _gs = sum(g for _, g in _gaps) or 1.0
             _plan = " · ".join(f"{n} {fmt_inr(transit_value * g / _gs)}"
                                for n, g in sorted(_gaps, key=lambda x: -x[1])[:5])
-            _tips.append(f"⏳ **{fmt_inr(transit_value)} in transit** (chits + small FDs "
-                         f"retiring Jul–Aug 26) → landing plan to fill gaps: {_plan}. "
+            _tev = [e for e in upcoming_events(holdings_df)
+                    if e["kind"] == "transit" and e["days"] >= -3]
+            _sched = "  \n".join(
+                f"  · **{e['name'][:46]}** {fmt_inr(e['value'])} — lands in "
+                f"**{e['days']}d** ({datetime.fromisoformat(e['date']).strftime('%d %b')})"
+                for e in _tev)
+            _tips.append(f"⏳ **{fmt_inr(transit_value)} in transit**, each piece dated:  \n"
+                         f"{_sched}  \n"
+                         f"  → landing plan on arrival: {_plan}. "
                          f"Lock this on paper before the money arrives.")
         if safety_value > 0:
             _tips.append(f"🛡 **Permanent safety floor** {fmt_inr(safety_value)} (EPF, post "
