@@ -343,9 +343,14 @@ fi_inp = FIInputs(
 )
 base_result = project(fi_inp)  # 10% baseline-ish (uses stored return default)
 _tgt_sleeves = dict(db.get_target_allocation())
-safety_value = (holdings_df.loc[~holdings_df["Sleeve"].isin(_tgt_sleeves), "Value"].sum()
-                if not holdings_df.empty else 0.0)
-total_net_worth = net_worth_growth + safety_value + fi_inp.pf_current + fi_inp.nps_current
+_non_tgt = (holdings_df.loc[~holdings_df["Sleeve"].isin(_tgt_sleeves)]
+            if not holdings_df.empty else holdings_df)
+transit_value = (_non_tgt.loc[_non_tgt["Sleeve"] == "Transit (redeploying)", "Value"].sum()
+                 if _non_tgt is not None and not _non_tgt.empty else 0.0)
+safety_value = ((_non_tgt["Value"].sum() if _non_tgt is not None and not _non_tgt.empty else 0.0)
+                - transit_value)
+total_net_worth = (net_worth_growth + safety_value + transit_value
+                   + fi_inp.pf_current + fi_inp.nps_current)
 
 st.markdown(f"#### 💰 MAVI Vault  ·  *{st.session_state.get('user','')}*")
 if any_stale:
@@ -576,8 +581,9 @@ with tab1:
     c3.metric("Debt Layer (PF+NPS)", fmt_inr(fi_inp.pf_current + fi_inp.nps_current))
 
     st.markdown("##### Allocation — current vs target (growth sleeve)")
-    st.caption(f"🛡 Safety floor outside these targets (FDs, EPF, chits, post office): "
-               f"{fmt_inr(safety_value)}  ·  Household total: {fmt_inr(total_net_worth)}")
+    st.caption(f"🛡 Permanent safety floor (EPF, post office): {fmt_inr(safety_value)}  ·  "
+               f"⏳ Transit, redeploying Jul–Aug 26 (chits, small FDs): {fmt_inr(transit_value)}  ·  "
+               f"Household total: {fmt_inr(total_net_worth)}")
     left, right = st.columns([1, 1])
 
     with left:
@@ -906,10 +912,22 @@ with tab5:
                       " No new money; let growth elsewhere dilute it.")
                 _tips.append(f"**{_r['Sleeve']}** overweight ({_r['Current %']:.0f}% vs "
                              f"{_r['Target %']:.0f}%).{_x}")
+        if transit_value > 0:
+            _ft = net_worth_growth + transit_value
+            _gaps = []
+            for _, _r in sleeve_df.iterrows():
+                _need = max(0.0, _r["Target %"] / 100.0 * _ft - _r["Value"])
+                if _need > 1000:
+                    _gaps.append((_r["Sleeve"], _need))
+            _gs = sum(g for _, g in _gaps) or 1.0
+            _plan = " · ".join(f"{n} {fmt_inr(transit_value * g / _gs)}"
+                               for n, g in sorted(_gaps, key=lambda x: -x[1])[:5])
+            _tips.append(f"⏳ **{fmt_inr(transit_value)} in transit** (chits + small FDs "
+                         f"retiring Jul–Aug 26) → landing plan to fill gaps: {_plan}. "
+                         f"Lock this on paper before the money arrives.")
         if safety_value > 0:
-            _tips.append(f"**Safety floor** {fmt_inr(safety_value)} sits outside growth "
-                         f"targets (by design). Any upcoming liquidity (chit exits, FD "
-                         f"maturities) should get a written destination *before* it lands.")
+            _tips.append(f"🛡 **Permanent safety floor** {fmt_inr(safety_value)} (EPF, post "
+                         f"office) stays outside growth targets — by design, untouched.")
         _tips.append("_Rules: cash-flow rebalancing (new money → underweight sleeves; "
                      "selling = last resort) · 5% deviation band · Direct Stocks governed "
                      "by the monthly rulebook review._")
