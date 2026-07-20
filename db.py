@@ -309,6 +309,17 @@ def get_target_allocation():
     return [(s, by_sleeve.get(s, 0.0)) for s in SLEEVES]
 
 
+def set_target_allocation(sleeve, target_pct):
+    """Upsert one sleeve's locked target %. Charter: targets move only by
+    explicit user decision (Targets tab CONFIRM gate) — this helper has no
+    guard of its own, the caller owns that discipline."""
+    execute(
+        "INSERT INTO target_allocation (sleeve, target_pct) VALUES (?, ?) "
+        "ON CONFLICT(sleeve) DO UPDATE SET target_pct = excluded.target_pct",
+        (sleeve, float(target_pct)),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Holdings
 # ---------------------------------------------------------------------------
@@ -387,6 +398,23 @@ def delete_goal(goal_id):
 # ---------------------------------------------------------------------------
 # Liabilities (loans/EMIs — cash-flow only, never netted against investments)
 # ---------------------------------------------------------------------------
+# Schema note: this table was created directly against the live Turso DB
+# (dt_system OPEN_ITEMS C10, 2026-07-20) — there is no CREATE TABLE for it in
+# this repo's history. Confirmed live columns (dt_system/wealth_pull.py's
+# working SELECT): name, outstanding, emi, rate_pct, tenure_months,
+# provenance. The IF NOT EXISTS below matches that confirmed shape exactly
+# (plus an id PK) so it's a true no-op against the real Turso table and only
+# helps a fresh local-SQLite install start from the same schema.
+LIABILITY_COLS = ("name", "outstanding", "emi", "rate_pct", "tenure_months", "provenance")
+
+
+def _ensure_liabilities_table():
+    execute("""CREATE TABLE IF NOT EXISTS liabilities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL, outstanding REAL NOT NULL DEFAULT 0,
+        emi REAL, rate_pct REAL, tenure_months INTEGER, provenance TEXT)""")
+
+
 def get_liabilities():
     """All loan rows, or [] if the table doesn't exist yet on an older DB."""
     try:
@@ -395,14 +423,73 @@ def get_liabilities():
         return []
 
 
+def add_liability(name, outstanding, emi=None, rate_pct=None, tenure_months=None,
+                   provenance="user-entered"):
+    """Insert one loan row. Writes ONLY the 6 columns confirmed live on Turso
+    (see note above) — no lender/principal/start_date columns exist there."""
+    _ensure_liabilities_table()
+    execute(
+        "INSERT INTO liabilities (name, outstanding, emi, rate_pct, tenure_months, "
+        "provenance) VALUES (?, ?, ?, ?, ?, ?)",
+        (name, float(outstanding or 0), emi, rate_pct, tenure_months, provenance),
+    )
+
+
+def update_liability(liability_id, **fields):
+    """Update selected columns on one loan row. Drops any key not in
+    LIABILITY_COLS so a stray field can never crash the write against the
+    live table's real (narrower) column set — but raises if that leaves
+    NOTHING to write, rather than silently no-op'ing while the caller's UI
+    still reports success. Returns the number of rows affected (0 or 1) so
+    the caller can distinguish "updated" from "no row with that id"."""
+    fields = {k: v for k, v in fields.items() if k in LIABILITY_COLS}
+    if not fields:
+        raise ValueError(
+            "update_liability: no valid fields to write (all keys were "
+            f"outside LIABILITY_COLS={LIABILITY_COLS}) — refusing a silent no-op."
+        )
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    execute(f"UPDATE liabilities SET {cols} WHERE id = ?",
+            list(fields.values()) + [liability_id])
+    row = query_one("SELECT id FROM liabilities WHERE id = ?", (liability_id,))
+    return 1 if row else 0
+
+
+def delete_liability(liability_id):
+    execute("DELETE FROM liabilities WHERE id = ?", (liability_id,))
+
+
 # ---------------------------------------------------------------------------
 # App state (Sentinel -> Vault sync channel; key/value JSON blobs)
 # ---------------------------------------------------------------------------
-def get_app_state(key):
-    """One app_state row's JSON value, decoded to a dict, or {} if absent/missing table."""
+def get_app_state(key, strict=False):
+    """One app_state row's JSON value, decoded to a dict, or {} if absent.
+
+    strict=False (default, all existing call sites): any failure — table
+    missing, transient connection error, bad JSON — is swallowed and treated
+    the same as "key absent" ({}). This is the right behaviour for read-only
+    display code (a dashboard tile should degrade quietly, not crash).
+
+    strict=True: a genuine query/connection error RAISES instead of being
+    conflated with "key absent". Callers that are about to WRITE based on
+    "is there existing data under this key" (e.g. append_app_state_list) must
+    use strict=True — with strict=False, a transient Turso hiccup looks
+    identical to "no history yet", and appending on that false-empty read
+    would silently overwrite/lose real existing history.
+
+    "Table doesn't exist yet" is explicitly NOT treated as a strict-mode
+    error: it's ensured here first (idempotent CREATE TABLE IF NOT EXISTS,
+    matches the live Turso shape) so a fresh local SQLite install — which
+    has never had anything written to app_state — reads as a genuine, valid
+    "key absent" rather than tripping strict mode's error path on its very
+    first read. Only a real query/connection failure after that point raises.
+    """
+    _ensure_app_state_table()
     try:
         row = query_one("SELECT value, updated FROM app_state WHERE key = ?", (key,))
     except Exception:
+        if strict:
+            raise
         return {}
     if not row or not row.get("value"):
         return {}
@@ -413,4 +500,86 @@ def get_app_state(key):
             data.setdefault("_updated", row.get("updated"))
         return data
     except Exception:
+        if strict:
+            raise
         return {}
+
+
+def _ensure_app_state_table():
+    # Table already exists live (Sentinel created it one-time, 2026-07-20 —
+    # see dt_system/dashboard_update.py push_app_state). This mirrors that
+    # exact shape so it's a no-op against Turso and only helps a fresh local
+    # SQLite install.
+    execute("""CREATE TABLE IF NOT EXISTS app_state (
+        key TEXT PRIMARY KEY, value TEXT, updated TEXT)""")
+
+
+def set_app_state(key, value):
+    """Upsert one app_state row. `value` is any JSON-serialisable object
+    (dict/list) — this is the Vault-side counterpart to Sentinel's own
+    push_app_state upsert, same ON CONFLICT convention, same 'updated' column.
+    Used for Vault-authored blobs (e.g. targets_history) as well as any
+    throwaway test key — callers own cleanup for anything named *_test."""
+    import json
+    _ensure_app_state_table()
+    execute(
+        "INSERT INTO app_state (key, value, updated) VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+        "updated = excluded.updated",
+        (key, json.dumps(value), datetime.now().isoformat(timespec="seconds")),
+    )
+
+
+def delete_app_state(key):
+    """Remove one app_state row entirely — used to clean up throwaway test keys."""
+    try:
+        execute("DELETE FROM app_state WHERE key = ?", (key,))
+    except Exception:
+        pass
+
+
+_APPEND_LOCK = threading.RLock()  # serialises append_app_state_list's read-modify-write
+
+
+def append_app_state_list(key, record):
+    """Append one record to a JSON-LIST app_state value, creating it if absent.
+
+    Used for audit trails (e.g. "targets_history"): reads the current value,
+    appends `record`, writes the whole list back as one upsert. get_app_state
+    returns the stored JSON verbatim for non-dict payloads (a stored list
+    comes back as a list, untouched) — so the only cases here are "absent"
+    ({}  ->  start a new list) and "already a list" (append to it). A key
+    that holds a genuine dict blob (e.g. sentinel_manifest) is a caller bug —
+    refuse to silently clobber it rather than guess.
+
+    Uses strict=True on the read: a transient query/connection error RAISES
+    here instead of being silently treated as "key absent" — the latter
+    would let a Turso hiccup masquerade as an empty key and overwrite real
+    existing history with a fresh single-entry list. Callers must not catch
+    this and retry-as-empty; surface the failure and let the caller decide
+    (the Targets tab aborts the whole save on this, see app.py).
+
+    Concurrency: the read-modify-write sequence is wrapped in a dedicated
+    `_APPEND_LOCK` (separate from the module's per-statement `_LOCK`, which
+    only serialises individual query()/execute() calls, not a multi-call
+    sequence). This makes two overlapping calls from the SAME PROCESS safe
+    (no lost update between two Streamlit reruns in one server process).
+    It is NOT a database-level transaction, so it does not protect against
+    two separate processes/machines writing concurrently — acceptable for
+    this 2-user household app, which runs as one Streamlit process.
+    """
+    with _APPEND_LOCK:
+        current = get_app_state(key, strict=True)
+        if isinstance(current, list):
+            history = current
+        elif current == {}:
+            history = []
+        else:
+            raise ValueError(
+                f"app_state key '{key}' already holds a non-list blob "
+                f"({type(current).__name__}); append_app_state_list refuses to "
+                "overwrite it."
+            )
+        history = history + [record]
+        set_app_state(key, history)
+        return history

@@ -15,6 +15,7 @@ Module layout:
   app.py       — this file: auth gate, theme, 5 tabs, charts
 """
 
+import re
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -78,6 +79,15 @@ INSTRUMENT_HINTS = {
 #     count toward net worth growth and (if ever tagged) sleeve gap math.
 SAFETY_LAYER_SLEEVES = {"Debt / Safety", "Family (Parents)"}
 GROWTH_EXTRA_SLEEVES = {"Family (Father)"}  # counts as growth but has no target %
+
+# Emergency fund as a first-class sleeve (Feature A, 2026-07-20). Its own
+# fourth layer bucket — deliberately NOT in growth (no target %, not the
+# rebalance/gap pool), NOT in the locked safety floor (this money must stay
+# genuinely liquid, unlike EPF/NSCs), NOT transit (it has no landing date,
+# it just sits ready). Until a holding exists in this sleeve the Deploy tab
+# keeps today's manual-input behaviour — this is additive, never a forced
+# migration of existing data.
+EMERGENCY_SLEEVE = "🚨 Emergency (liquid)"
 
 # Soft, modern CSS polish — rounded cards, breathing room, mobile friendly.
 st.markdown(
@@ -311,6 +321,8 @@ def suggestion_chip(sleeve, sleeve_pct, target_pct):
         return "CONTINUE SIP", "best compounder in the house — never break to prepay"
     if sleeve == "Transit (redeploying)":
         return "REDEPLOY", "dated money awaiting its landing-plan destination"
+    if sleeve == EMERGENCY_SLEEVE:
+        return "HOLD · liquid", "goal-tracked (₹12L), not a %-target sleeve — keep it reachable"
     if target_pct is None:
         return "HOLD", "no target set for this sleeve yet"
     if sleeve_pct < target_pct * 0.8:
@@ -318,6 +330,47 @@ def suggestion_chip(sleeve, sleeve_pct, target_pct):
     if sleeve_pct > target_pct * 1.5:
         return "PAUSE", f"sleeve at {sleeve_pct:.0f}% vs {target_pct:.0f}% target — overweight"
     return "HOLD", f"sleeve near target ({sleeve_pct:.0f}% vs {target_pct:.0f}%)"
+
+
+MAX_MATURITY_PARSE_MULTIPLE = 20.0  # reject a name-parsed value >20x or <1/20x current Value
+
+
+def parse_maturity_value_from_name(name, current_value=None):
+    """Best-effort ₹ maturity value embedded in a holding's asset name.
+
+    Looks for an Indian-lakh/crore-style amount near a ₹ sign, e.g.
+    "NSC — matures ₹5.2L 2029" -> 520000.0, "Fund ₹36.2L" -> 3620000.0,
+    "₹50000" -> 50000.0. Returns None if nothing parses, OR if what parsed
+    fails a plausibility check against the holding's current priced value
+    (this function never guesses a number that isn't textually present, and
+    never hands back a wildly implausible one either — review fix: an
+    unanchored name like "Fund managed by ₹500 Cr AUM firm" would otherwise
+    parse as a ₹500 crore "maturity value" with nothing to catch it).
+
+    `current_value`, if given, bounds the accepted parse to within
+    MAX_MATURITY_PARSE_MULTIPLE x the holding's current Value in either
+    direction — a real NSC maturity value is a modest multiple of what it's
+    worth today (interest accrual), never orders of magnitude off.
+    """
+    if not name:
+        return None
+    m = re.search(r"₹\s*([\d,]+\.?\d*)\s*(cr|crore|l|lakh|lac)?", str(name), re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        amt = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    unit = (m.group(2) or "").lower()
+    if unit in ("cr", "crore"):
+        amt *= 1e7
+    elif unit in ("l", "lakh", "lac"):
+        amt *= 1e5
+    if current_value and current_value > 0:
+        ratio = amt / current_value
+        if ratio > MAX_MATURITY_PARSE_MULTIPLE or ratio < (1.0 / MAX_MATURITY_PARSE_MULTIPLE):
+            return None  # implausible vs the holding's actual priced value — reject
+    return amt
 
 
 def upcoming_events(df):
@@ -340,13 +393,85 @@ def upcoming_events(df):
             kind = "transit" if "Transit" in str(r["Sleeve"]) else "safety"
             prov = r.get("Prov") if pd.notna(r.get("Prov")) else "estimated"
             ev.append({"name": r["Asset"], "value": r["Value"], "date": str(r["Maturity"]),
-                       "days": d, "kind": kind, "prov": prov})
+                       "days": d, "kind": kind, "prov": prov, "sleeve": r["Sleeve"]})
     nm = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
     ev.append({"name": "Monthly Direct-Stocks review (10-min rulebook pass)",
                "value": 0, "date": nm.isoformat(), "days": (nm - today).days,
-               "kind": "ritual", "prov": "confirmed"})
+               "kind": "ritual", "prov": "confirmed", "sleeve": None})
     ev.sort(key=lambda e: e["days"])
     return ev
+
+
+IDLE_TRANSIT_AGE_DAYS = 30   # "sat too long with no destination"
+IDLE_TRANSIT_HORIZON_DAYS = 45  # a maturity inside this window means it's NOT idle
+
+
+def detect_idle_transit(df):
+    """Feature D (charter Phase B4): flag Transit-sleeve money that's been
+    sitting with no near-term destination.
+
+    Rule: a Transit (redeploying) holding is IDLE if its buy_date is more
+    than IDLE_TRANSIT_AGE_DAYS old AND it has no maturity_date within the
+    next IDLE_TRANSIT_HORIZON_DAYS.
+
+    buy_date fallback: the spec also allows deriving an age from
+    "maturity_date minus tenure" when buy_date is absent — but holdings have
+    no tenure column in this schema (tenure only exists on liabilities;
+    verified against db.py/init_db and the live liabilities query). Rather
+    than invent a number, a Transit holding with NO buy_date and no way to
+    compute an age is flagged SEPARATELY as "age unknown" (review fix,
+    2026-07-20 — the earlier version silently skipped these entirely, which
+    is exactly backwards: a holding with no recorded start date is the
+    likeliest real data-gap case, not a safe case to stay silent on).
+
+    Emergency (liquid) shortfalls are explicitly out of scope — that is the
+    waterfall's job (Deploy tab), never this detector's.
+
+    Returns a list of dicts, oldest/most-uncertain first. Each dict has
+    `name`, `value`, and either `days_held` (int, a real computed age) or
+    `age_unknown=True` (no buy_date to compute from) — callers should check
+    for `age_unknown` before formatting `days_held`.
+    """
+    if df.empty:
+        return []
+    today = datetime.now().date()
+    idle = []
+    tdf = df.loc[df["Sleeve"] == "Transit (redeploying)"]
+    # `df` here is the priced holdings DataFrame (Asset/Sleeve/Value/... — see
+    # compute_holdings_table), which does NOT carry buy_date as a bare column
+    # (only "Maturity"/"Prov" made it in). Pull buy_date from the raw holdings
+    # rows (db.get_holdings()) keyed by id.
+    raw_by_id = {h["id"]: h for h in db.get_holdings()}
+    for _, r in tdf.iterrows():
+        h = raw_by_id.get(r.get("id"))
+        if not h:
+            continue
+        buy_date_raw = h.get("buy_date")
+        maturity_raw = h.get("maturity_date")
+        if not buy_date_raw:
+            idle.append({"name": r["Asset"], "value": r["Value"], "age_unknown": True})
+            continue
+        try:
+            buy_date = datetime.fromisoformat(str(buy_date_raw)).date()
+        except Exception:
+            idle.append({"name": r["Asset"], "value": r["Value"], "age_unknown": True})
+            continue
+        days_held = (today - buy_date).days
+        if days_held <= IDLE_TRANSIT_AGE_DAYS:
+            continue
+        has_near_maturity = False
+        if maturity_raw:
+            try:
+                mdate = datetime.fromisoformat(str(maturity_raw)).date()
+                if 0 <= (mdate - today).days <= IDLE_TRANSIT_HORIZON_DAYS:
+                    has_near_maturity = True
+            except Exception:
+                pass
+        if not has_near_maturity:
+            idle.append({"name": r["Asset"], "value": r["Value"], "days_held": days_held,
+                        "age_unknown": False})
+    idle.sort(key=lambda x: -(x["days_held"] if not x.get("age_unknown") else 10**9))
+    return idle
 
 
 def sleeve_breakdown(df):
@@ -613,20 +738,25 @@ fi_inp = FIInputs(
 base_result = project(fi_inp)  # 10% baseline-ish (uses stored return default)
 _tgt_sleeves = dict(db.get_target_allocation())
 # One-household layer split (Codex/user doctrine 2026-07-20): every holding
-# lands in exactly ONE of three buckets — growth (net_worth_growth = sleeve_pool
+# lands in exactly ONE of FOUR buckets — growth (net_worth_growth = sleeve_pool
 # [target sleeves] + Family (Father), computed above), transit (dated, awaiting
-# redeployment), or the locked safety floor (Debt/Safety + Family (Parents)
-# NSCs). Explicit membership sets avoid the old "everything not a target
-# sleeve" catch-all, which orphaned/double-counted non-target growth sleeves
-# like Family (Father).
+# redeployment), the locked safety floor (Debt/Safety + Family (Parents)
+# NSCs), or emergency (liquid, Feature A 2026-07-20 — its own bucket, NOT
+# growth/gap-pool, NOT locked safety, NOT transit; see EMERGENCY_SLEEVE note).
+# Explicit membership sets avoid the old "everything not a target sleeve"
+# catch-all, which orphaned/double-counted non-target growth sleeves like
+# Family (Father).
 _growth_sleeves = set(_tgt_sleeves) | GROWTH_EXTRA_SLEEVES
 transit_value = (holdings_df.loc[holdings_df["Sleeve"] == "Transit (redeploying)", "Value"].sum()
                  if not holdings_df.empty else 0.0)
 safety_value = (holdings_df.loc[holdings_df["Sleeve"].isin(SAFETY_LAYER_SLEEVES), "Value"].sum()
                 if not holdings_df.empty else 0.0)
+emergency_holdings_value = (
+    holdings_df.loc[holdings_df["Sleeve"] == EMERGENCY_SLEEVE, "Value"].sum()
+    if not holdings_df.empty else 0.0)
 _unmapped_sleeves = (sorted(set(holdings_df["Sleeve"].unique())
                             - _growth_sleeves - SAFETY_LAYER_SLEEVES
-                            - {"Transit (redeploying)"})
+                            - {"Transit (redeploying)", EMERGENCY_SLEEVE})
                      if not holdings_df.empty else [])
 # Household total: EPF already sits inside safety_value (holdings rows), so add
 # only the EXPLICIT pf/nps settings here — never the holdings-derived feed —
@@ -635,13 +765,37 @@ _unmapped_sleeves = (sorted(set(holdings_df["Sleeve"].unique())
 # setting), net worth uses the holdings rows only and a blocking warning renders.
 _pf_setting = s_float("pf_current", 0)
 _pf_conflict = _epf_from_holdings > 0 and _pf_setting > 0
-total_net_worth = (net_worth_growth + safety_value + transit_value
+total_net_worth = (net_worth_growth + safety_value + transit_value + emergency_holdings_value
                    + (0.0 if _pf_conflict else _pf_setting)
                    + s_float("nps_current", 0))
 
 # Concentration guard (Fix 2): computed once here, rendered on "Start Here"
 # and "Goals & Rebalance" only (not a global header banner like _pf_conflict).
 _concentration_hit = concentration_check(holdings_df, net_worth_growth)
+
+# Feature A: emergency-fund goal progress, computed once here so Start Here
+# and Deploy This Month agree on the SAME number (code-review fix, 2026-07-20:
+# these two tabs previously derived the goal amount from two independent
+# sources — the Deploy tab's Sentinel-manifest override and this header's
+# goals-table lookup — which could silently disagree if either was edited
+# without the other). Single precedence chain, used everywhere from here on:
+#   1. Sentinel manifest override (app_state["sentinel_manifest"]["emergency_goal"])
+#   2. goals table row with kind='emergency' (seeded ₹12L in db.DEFAULT_GOALS —
+#      this is the charter target a user edits via Goals & Rebalance)
+#   3. hardcoded EMERGENCY_GOAL_DEFAULT, if both above are absent.
+# Progress uses LIVE HOLDINGS ONLY (emergency_holdings_value) at the header
+# level — the Deploy tab's per-session manual override is a "this month's
+# plan" input, not a change to the tracked balance, so it uses its own em_bal
+# for ITS progress bar (see tab_deploy) while sharing this same goal amount.
+_em_manifest = db.get_app_state("sentinel_manifest")
+_em_goal_row = next((g for g in db.get_goals() if g["kind"] == "emergency"), None)
+_em_goal_amount = float(
+    _em_manifest.get("emergency_goal")
+    or (_em_goal_row["target_amount"] if _em_goal_row else None)
+    or EMERGENCY_GOAL_DEFAULT
+)
+_em_goal_progress_pct = (min(emergency_holdings_value / _em_goal_amount * 100.0, 100.0)
+                         if _em_goal_amount else 0.0)
 
 st.markdown(
     f"""<div class="vault-hero"><span class="wm"><b>MAVI</b> VAULT</span>
@@ -683,9 +837,10 @@ k4.metric("Est. FI Date", fi_date,
 
 st.divider()
 
-tab_start, tab1, tab_deploy, tab_scanner, tab2, tab3, tab4, tab5 = st.tabs([
+tab_start, tab1, tab_targets, tab_deploy, tab_scanner, tab2, tab3, tab4, tab5 = st.tabs([
     "🚀 Start Here",
     "📊 Net Worth & Allocation",
+    "🎯 Targets",
     "💸 Deploy This Month",
     "🔎 Scanner",
     "💵 Cash Flow & Savings",
@@ -702,6 +857,22 @@ tab_start, tab1, tab_deploy, tab_scanner, tab2, tab3, tab4, tab5 = st.tabs([
 with tab_start:
     if _concentration_hit:
         st.warning(concentration_warning_text(_concentration_hit))
+
+    # Feature D: idle-cash detector (charter Phase B4) — Transit money that's
+    # sat >30 days with no destination inside the next 45. One warning per
+    # flagged holding, same pattern as the concentration-guard banner above.
+    # age_unknown holdings (no buy_date recorded) get a distinct message —
+    # review fix: these were previously silently skipped, which is backwards
+    # since a missing start date is itself the data gap worth surfacing.
+    for _idle in detect_idle_transit(holdings_df):
+        if _idle.get("age_unknown"):
+            st.warning(f"💤 {_idle['name']} {fmt_inr(_idle['value'])} is a transit "
+                       f"holding with no buy_date — age unknown, add the date or "
+                       f"route it via Deploy This Month.")
+        else:
+            st.warning(f"💤 Idle money: {_idle['name']} {fmt_inr(_idle['value'])} has sat "
+                       f"in transit >30 days with no destination — route it via "
+                       f"Deploy This Month.")
 
     # First-time users start at step 1; returning users see the summary (step 4).
     st.session_state.setdefault("wiz", 4 if not holdings_df.empty else 1)
@@ -799,6 +970,9 @@ with tab_start:
         m3.metric("Est. FI Date",
                   f"age {base_result.fi_age}" if base_result.fi_age
                   else f">{fi_inp.retirement_age}")
+        st.caption(f"🚨 Emergency fund: {fmt_inr(emergency_holdings_value)} / "
+                   f"{fmt_inr(_em_goal_amount)} ({_em_goal_progress_pct:.0f}%)")
+        st.progress(min(_em_goal_progress_pct / 100.0, 1.0))
         st.markdown(
             """
 **Your monthly routine from now on — just 2 steps:**
@@ -831,7 +1005,10 @@ with tab_deploy:
     # back to the hardcoded defaults if the key/table isn't there yet.
     _manifest = db.get_app_state("sentinel_manifest")
     _em_floor = float(_manifest.get("emergency_floor") or EMERGENCY_FLOOR_DEFAULT)
-    _em_goal = float(_manifest.get("emergency_goal") or EMERGENCY_GOAL_DEFAULT)
+    # _em_goal_amount (same precedence chain: manifest -> goals table -> default)
+    # is computed once at header level so this tab agrees with Start Here —
+    # see the header comment above _em_goal_amount for the full rationale.
+    _em_goal = _em_goal_amount
     _em_vehicles = _manifest.get("emergency_vehicles") or EMERGENCY_VEHICLES_DEFAULT
 
     dc1, dc2, dc3 = st.columns([1, 1, 1.3])
@@ -839,13 +1016,40 @@ with tab_deploy:
         amt = st.number_input("Amount to invest this month (₹)", min_value=0.0,
                               value=float(investable or 100000), step=10000.0)
     with dc2:
+        # Feature A: once a "🚨 Emergency (liquid)" holding exists, its summed
+        # Value auto-fills this input (live from holdings). The field stays
+        # editable — whatever the user types is still what feeds the
+        # waterfall below, so typing over the auto-fill is a genuine
+        # override, not a fight with the widget. Until such a holding exists,
+        # this is byte-for-byte the old manual-input behaviour.
+        #
+        # Review fix: a keyed number_input only honors `value=` on that key's
+        # FIRST render ever — every rerun after that is driven purely by
+        # session_state, so a naive `value=emergency_holdings_value` goes
+        # stale the moment holdings change on a later rerun while the
+        # "live from holdings" caption below keeps claiming it's live. Fix:
+        # explicitly re-sync session_state to the live figure whenever the
+        # live figure itself changes (tracked via a sentinel key), BEFORE
+        # instantiating the widget — then the widget is created with key=
+        # only, no competing value=. A manual override within the same live
+        # figure still sticks; it only re-syncs when holdings actually move.
+        _em_has_holdings = emergency_holdings_value > 0
+        if _em_has_holdings:
+            if st.session_state.get("_em_live_seen") != emergency_holdings_value:
+                st.session_state["deploy_em_balance"] = emergency_holdings_value
+                st.session_state["_em_live_seen"] = emergency_holdings_value
+        else:
+            st.session_state.setdefault("deploy_em_balance", 0.0)
         em_bal = st.number_input(
             "Liquid emergency money you already hold (₹)", min_value=0.0,
-            value=float(st.session_state.get("deploy_em_balance", 0.0)), step=10000.0,
+            step=10000.0,
             help="Bank / liquid-fund / sweep-FD balance — the TRUE liquid buffer. "
                  "EPF and NSCs don't count; they're locked.",
             key="deploy_em_balance",
         )
+        if _em_has_holdings:
+            st.caption(f"🟢 live from holdings: {fmt_inr(emergency_holdings_value)} "
+                       "— edit to override this month only.")
     with dc3:
         mode_label = st.radio(
             "How to split the sleeve portion",
@@ -855,6 +1059,20 @@ with tab_deploy:
                  "give the same answer.",
         )
     mode = "rebalance" if mode_label.startswith("Smart") else "simple"
+
+    # Feature A: progress vs the Vault emergency GOAL (goals table, kind=
+    # 'emergency' — ₹12L, seeded in db.DEFAULT_GOALS; _em_goal_amount computed
+    # once at header level). Distinct from _em_floor (the ₹3.6L waterfall
+    # trigger above) — the floor is when the waterfall stops force-feeding
+    # this line; the goal is the longer-run target it keeps growing toward
+    # after that. Uses em_bal (this tab's live-or-override balance) rather
+    # than the header's holdings-only number, since this bar is about what's
+    # being planned right here.
+    _em_bal_goal_pct = (min(em_bal / _em_goal_amount * 100.0, 100.0)
+                        if _em_goal_amount else 0.0)
+    st.caption(f"🚨 Emergency fund progress: {fmt_inr(em_bal)} / {fmt_inr(_em_goal_amount)} "
+               f"({_em_bal_goal_pct:.0f}%)")
+    st.progress(min(_em_bal_goal_pct / 100.0, 1.0))
 
     em_amount, sleeve_plan = emergency_first_plan(
         amt, em_bal, sleeve_df, sleeve_pool, _em_floor, mode)
@@ -1040,15 +1258,60 @@ with tab1:
                 f"**{e['name'][:48]}** — {e['days']} day{'s' if e['days'] != 1 else ''} away"
                 for e in _soon))
 
+        # Feature F: the "Monthly Direct-Stocks review" chip above is a visual
+        # reminder only (raw HTML, not clickable) — this expander is where you
+        # actually DO the 10-minute rulebook pass. Static checklist, no state
+        # persistence this round (per spec).
+        with st.expander("📋 Monthly Direct-Stocks review (10-min rulebook pass) — open to do it now"):
+            st.markdown(
+                """
+1. **Per holding**: has any stop-loss / exit rule been breached?
+2. **Concentration**: any single name >15% of the Direct Stocks sleeve, or any sector >25%?
+3. **Basket drawdown**: check current drawdown vs the −12% / −18% / −25% ladder.
+4. **Thesis check**: has the original thesis broken on any name?
+5. **Scanner cross-check**: is any Scanner-tab candidate strictly better than a current holding?
+                """
+            )
+            st.caption("Full rulebook: mavi_collab/outbox/2026-06-13-081-result.md — "
+                       "Direct Stocks currently holds only Mansi's L&T + HDFC Bank "
+                       "(~₹50k), so steps 1–4 are quick.")
+
+    # Feature E: maturity horizon beyond the 140-day timeline above. Same
+    # holdings-derived maturity data (upcoming_events), just the far end of
+    # the list instead of the near end. Muted/caption styling deliberately —
+    # this is "known and scheduled", not something needing attention now.
+    # Value shown per line: parsed from the asset name where present (NSC
+    # names sometimes embed their fixed maturity/face value, which differs
+    # from today's marked-to-market Value), else the current priced Value.
+    # Emergency (liquid) is explicitly excluded here (code review finding,
+    # 2026-07-20): that sleeve is genuinely liquid/on-demand by definition —
+    # a sweep-FD renewal date living inside it must never render as a distant
+    # "locked maturity" line alongside NSCs.
+    _beyond = [e for e in upcoming_events(holdings_df)
+              if e["days"] > 140 and e["kind"] != "ritual" and e.get("sleeve") != EMERGENCY_SLEEVE]
+    if _beyond:
+        st.caption("**Beyond the horizon:**")
+        for _e in _beyond[:3]:
+            _when = datetime.fromisoformat(_e["date"]).strftime("%b %Y")
+            _parsed = parse_maturity_value_from_name(_e["name"], current_value=_e["value"])
+            _show_val = _parsed if _parsed is not None else _e["value"]
+            st.caption(f"  · {_e['name'][:58]} — {fmt_inr(_show_val)} — {_when}")
+        st.caption("_NSC ladder totals ₹36.2L across Apr 2029 – Jan 2031 — arrives "
+                   "exactly as the ₹35L loans finish._")
+
     st.markdown("##### Allocation — current vs target (growth sleeve)")
+    _em_caption_part = (f"🚨 Emergency (liquid): {fmt_inr(emergency_holdings_value)}  ·  "
+                        if emergency_holdings_value > 0 else "")
     st.caption(f"🛡 Locked-in base (EPF, post office, all NSCs): {fmt_inr(safety_value)}  ·  "
                f"⏳ Transit, redeploying Jul–Aug 26 (chits, small FDs): {fmt_inr(transit_value)}  ·  "
+               f"{_em_caption_part}"
                f"Household total: {fmt_inr(total_net_worth)}")
 
-    # Layer breakup (Fix 6, 2026-07-20): click into each of the three layers to
-    # see exactly which holdings sit inside it — same one-household mapping
-    # (_growth_sleeves / SAFETY_LAYER_SLEEVES / "Transit (redeploying)") used
-    # to compute net_worth_growth / safety_value / transit_value above.
+    # Layer breakup (Fix 6, 2026-07-20; Emergency bucket added Feature A): click
+    # into each of the four layers to see exactly which holdings sit inside it —
+    # same one-household mapping (_growth_sleeves / SAFETY_LAYER_SLEEVES /
+    # "Transit (redeploying)" / EMERGENCY_SLEEVE) used to compute
+    # net_worth_growth / safety_value / transit_value / emergency_holdings_value above.
     def _layer_holdings_table(sleeve_mask):
         ldf = holdings_df.loc[sleeve_mask, ["Asset", "Sleeve", "Value"]].sort_values(
             "Value", ascending=False)
@@ -1072,6 +1335,12 @@ with tab1:
             st.caption("No transit holdings yet.")
         else:
             _layer_holdings_table(holdings_df["Sleeve"] == "Transit (redeploying)")
+    with st.expander(f"{EMERGENCY_SLEEVE} ({fmt_inr(emergency_holdings_value)})"):
+        if holdings_df.empty or not (holdings_df["Sleeve"] == EMERGENCY_SLEEVE).any():
+            st.caption("No holdings tagged Emergency (liquid) yet — the Deploy tab's "
+                       "emergency line still uses manual input until one exists.")
+        else:
+            _layer_holdings_table(holdings_df["Sleeve"] == EMERGENCY_SLEEVE)
 
     left, right = st.columns([1, 1])
 
@@ -1159,6 +1428,239 @@ with tab1:
             "parents' NSCs mature **₹36.2L across 2029–31**, timed to cover the loans "
             "as they wind down."
         )
+
+    # ---- Feature C: liabilities editor (2026-07-20) -----------------------
+    # Schema note (verified against the live query in dt_system/wealth_pull.py):
+    # the liabilities table's confirmed columns are name, outstanding, emi,
+    # rate_pct, tenure_months, provenance. There is no lender / principal /
+    # start_date column on the live table today. The add-loan form below still
+    # takes lender/principal/start_date as inputs (matching the request) but
+    # only writes the 6 confirmed columns to the DB — the caption makes that
+    # explicit rather than silently dropping what you typed.
+    with st.expander("✏️ Edit loans"):
+        liabilities = db.get_liabilities()
+        st.caption("⚠ Live schema currently stores **name, outstanding, EMI, rate, "
+                   "tenure (months), provenance** only — lender/principal/start-date "
+                   "aren't persisted columns yet even though the add-loan form below "
+                   "takes them (kept for when the schema grows).")
+        if liabilities:
+            st.markdown("**Existing loans**")
+            for l in liabilities:
+                _lid = l["id"]
+                st.markdown(f"— **{l.get('name') or '?'}**")
+                ec1, ec2, ec3 = st.columns(3)
+                _new_outstanding = ec1.number_input(
+                    "Outstanding (₹)", min_value=0.0,
+                    value=float(l.get("outstanding") or 0), step=10000.0,
+                    key=f"liab_outstanding_{_lid}")
+                _new_emi = ec2.number_input(
+                    "EMI (₹/mo)", min_value=0.0, value=float(l.get("emi") or 0),
+                    step=500.0, key=f"liab_emi_{_lid}")
+                _new_rate = ec3.number_input(
+                    "Rate (%)", min_value=0.0, max_value=50.0,
+                    value=float(l.get("rate_pct") or 0), step=0.05,
+                    format="%.2f", key=f"liab_rate_{_lid}")
+                es1, es2 = st.columns([1, 1])
+                if es1.button("💾 Save", key=f"liab_save_{_lid}"):
+                    # update_liability now returns the affected row count
+                    # (review fix) — only claim success on an actual write.
+                    _rows = db.update_liability(
+                        _lid, outstanding=_new_outstanding, emi=_new_emi,
+                        rate_pct=_new_rate,
+                        provenance=f"user-confirmed {datetime.now().strftime('%Y-%m-%d')}")
+                    if _rows:
+                        st.success(f"Saved {l.get('name')}.")
+                        st.rerun()
+                    else:
+                        st.error(f"Save failed — no loan with id {_lid} found. "
+                                 "Nothing was written.")
+                _del_confirm = es2.text_input(
+                    "Type CONFIRM to delete", key=f"liab_delconfirm_{_lid}")
+                if _del_confirm.strip() == "CONFIRM":
+                    if st.button(f"🗑 Delete {l.get('name')}", key=f"liab_del_{_lid}"):
+                        db.delete_liability(_lid)
+                        st.success(f"Deleted {l.get('name')}.")
+                        st.rerun()
+                st.divider()
+        else:
+            st.caption("No loans recorded yet — add one below.")
+
+        st.markdown("**Add a loan**")
+        with st.form("add_liability"):
+            al1, al2, al3 = st.columns(3)
+            al_name = al1.text_input("Name", placeholder="e.g. Home loan — SBI")
+            al_lender = al2.text_input("Lender", placeholder="e.g. SBI")
+            al_principal = al3.number_input("Original principal (₹)", min_value=0.0, step=10000.0)
+            al4, al5, al6 = st.columns(3)
+            al_outstanding = al4.number_input("Outstanding (₹)", min_value=0.0, step=10000.0)
+            al_rate = al5.number_input("Rate (%)", min_value=0.0, max_value=50.0,
+                                       step=0.05, format="%.2f")
+            al_emi = al6.number_input("EMI (₹/mo)", min_value=0.0, step=500.0)
+            al7, al8 = st.columns(2)
+            al_tenure = al7.number_input("Tenure (months)", min_value=0, step=1)
+            al_start = al8.date_input("Start date", value=datetime.now())
+            if st.form_submit_button("➕ Add loan", use_container_width=True):
+                if al_name and al_outstanding >= 0:
+                    # Review fix: st.number_input ALWAYS returns a number
+                    # (never blank/None) — `x or None` was turning a
+                    # legitimate 0 (0% interest-free loan, 0 months tenure
+                    # remaining) into NULL. Pass the raw values straight
+                    # through; there is no "unset" case to coerce here.
+                    db.add_liability(
+                        al_name, al_outstanding, emi=al_emi,
+                        rate_pct=al_rate,
+                        tenure_months=int(al_tenure),
+                        provenance="user-entered",
+                    )
+                    st.success(
+                        f"Added {al_name}. (lender={al_lender or '—'}, "
+                        f"principal={fmt_inr(al_principal)}, start={al_start} — "
+                        "noted here but not yet persisted; see the schema caption above.)"
+                    )
+                    st.rerun()
+                else:
+                    st.error("Need at least a name and outstanding ≥ 0.")
+
+
+# ===========================================================================
+# TAB — TARGETS (Feature B, 2026-07-20): guided target-allocation sitting.
+# The 7 target_allocation sleeves are LOCKED by charter — this tab lets you
+# SEE the case for change (current %, deviation, market context) and PROPOSE
+# a new split, but saving requires typing CONFIRM: targets move only by
+# explicit user decision, never silently, never via a stray click.
+# ===========================================================================
+TARGETS_LOCKED_SINCE_DEFAULT = "locked since 2026-06-12 (Phase A)"
+
+# Known-evidence context captions per sleeve (task spec, 2026-07-20) — static
+# background facts to inform the sitting, not a recommendation of what to type.
+TARGETS_CONTEXT_CAPTIONS = {
+    "Global / US": "📊 Currently ~58% of the target-sleeve pool (overweight vs its "
+        "20% target) — the donut/deviation numbers on Net Worth & Allocation are "
+        "the live version of this.",
+    "Crypto": "📊 Crypto carries a 30% flat VDA tax in India with **no loss offset** — "
+        "factor the tax drag into any proposed change here.",
+    "Direct Stocks": "📊 Governed by the scanner + one-new-name-per-month rule "
+        "(see the Scanner tab and the Monthly review) — raising this target doesn't "
+        "relax that discipline.",
+}
+
+with tab_targets:
+    st.markdown("##### 🎯 Targets — guided sitting")
+    st.caption("The 7 locked sleeves. See the case, propose a new split, save only "
+               "by typing CONFIRM. Targets move by explicit decision only — this tab "
+               "makes no changes on its own.")
+
+    _mc_targets = market_context()
+    _targets_now = dict(db.get_target_allocation())
+    _cur_pct_map = {r["Sleeve"]: r["Current %"] for _, r in sleeve_df.iterrows()}
+    _dev_map = {r["Sleeve"]: r["Deviation"] for _, r in sleeve_df.iterrows()}
+
+    st.markdown("###### Current standing")
+    _std_rows = [{
+        "Sleeve": s,
+        "Locked target %": f"{_targets_now.get(s, 0):.0f}%",
+        "Current actual %": f"{_cur_pct_map.get(s, 0):.1f}%",
+        "Deviation": f"{_dev_map.get(s, 0):+.1f}pp",
+        "Market context": (context_badge(_mc_targets, s) or "—").lstrip(" ·").strip(),
+    } for s in db.SLEEVES]
+    st.dataframe(pd.DataFrame(_std_rows), use_container_width=True, hide_index=True)
+    for _s, _cap in TARGETS_CONTEXT_CAPTIONS.items():
+        st.caption(_cap)
+
+    st.divider()
+    st.markdown("###### Propose a new split")
+    _proposed = {}
+    _cols = st.columns(4)
+    for _i, _s in enumerate(db.SLEEVES):
+        with _cols[_i % 4]:
+            _proposed[_s] = st.number_input(
+                f"{_s}", min_value=0.0, max_value=100.0,
+                value=float(_targets_now.get(_s, 0.0)), step=1.0,
+                key=f"targets_proposed_{_s}",
+                help=f"Locked at {_targets_now.get(_s, 0):.0f}% today.",
+            )
+    _running_sum = sum(_proposed.values())
+    _sum_ok = abs(_running_sum - 100.0) <= 0.5
+    (st.success if _sum_ok else st.warning)(
+        f"Running sum: **{_running_sum:.1f}%** "
+        f"{'✅ within 100 ±0.5%' if _sum_ok else '— must equal 100 ±0.5% to save'}"
+    )
+
+    st.markdown("###### Save (requires confirmation)")
+    st.caption("Charter: targets move only by explicit user decision. Type "
+               "**CONFIRM** exactly to enable saving.")
+    _confirm_col, _save_col = st.columns([2, 1])
+    _confirm_text = _confirm_col.text_input(
+        "Type CONFIRM to enable saving", key="targets_confirm_text")
+    _can_save = _sum_ok and _confirm_text.strip() == "CONFIRM"
+    if _save_col.button("💾 Save new targets", disabled=not _can_save,
+                        use_container_width=True):
+        # Review fix (ordering + exception safety): the audit record is
+        # written FIRST, and target_allocation is updated ONLY if that
+        # succeeds — the old order (targets first, audit second) could leave
+        # targets silently changed with no audit trail and a crashed UI if
+        # the audit-append raised (e.g. a corrupted non-list targets_history
+        # value). append_app_state_list(strict read) itself raises rather
+        # than silently treating a read failure as "no history yet", so a
+        # transient DB hiccup here also aborts cleanly instead of risking a
+        # lost audit entry.
+        _old = dict(_targets_now)
+        _new = dict(_proposed)
+        try:
+            db.append_app_state_list("targets_history", {
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "old": _old,
+                "new": _new,
+            })
+        except ValueError:
+            st.error("🚫 targets_history is corrupted (holds a non-list value) — "
+                     "ABORTED. Nothing changed. Please report this before retrying.")
+        except Exception as _e:
+            st.error(f"🚫 Could not write the audit record — ABORTED, targets were "
+                     f"NOT changed. Try again. ({type(_e).__name__})")
+        else:
+            try:
+                for _s, _pct in _new.items():
+                    db.set_target_allocation(_s, _pct)
+            except Exception as _e:
+                st.error(f"⚠ Audit record was saved, but the target_allocation update "
+                         f"FAILED partway through — targets may be in a MIXED state. "
+                         f"Re-check the table below and re-save if needed. ({type(_e).__name__})")
+            else:
+                st.success("Saved. Targets updated and logged to the audit history below.")
+                st.rerun()
+    elif _confirm_text and not _can_save:
+        if not _sum_ok:
+            st.error("Fix the running sum to 100 ±0.5% first.")
+        else:
+            st.error("Type CONFIRM exactly (case-sensitive) to enable saving.")
+
+    st.divider()
+    st.markdown("###### Change history")
+    _th = db.get_app_state("targets_history")
+    if _th and not isinstance(_th, list):
+        # Visible corruption flag rather than silently treating a non-list
+        # value as "empty history" (review fix) — this key should only ever
+        # hold a JSON list; anything else means something wrote to it wrong.
+        st.error(f"⚠ targets_history holds an unexpected {type(_th).__name__}, not a "
+                 "list — the save button above will refuse to append until this is "
+                 "fixed. History display below is empty pending a fix.")
+        _th_list = []
+    else:
+        _th_list = _th if isinstance(_th, list) else []
+    if not _th_list:
+        st.caption(f"📌 {TARGETS_LOCKED_SINCE_DEFAULT} — no changes on file yet.")
+    else:
+        _last = _th_list[-1]
+        st.caption(f"📌 Last changed: {_last.get('ts', '?')}")
+        with st.expander(f"Full history ({len(_th_list)} change"
+                         f"{'s' if len(_th_list) != 1 else ''})"):
+            for _rec in reversed(_th_list):
+                _old_s = ", ".join(f"{k} {v:.0f}%" for k, v in (_rec.get("old") or {}).items())
+                _new_s = ", ".join(f"{k} {v:.0f}%" for k, v in (_rec.get("new") or {}).items())
+                st.markdown(f"**{_rec.get('ts', '?')}**  \n"
+                           f"From: {_old_s}  \n"
+                           f"To: {_new_s}")
 
 
 # ===========================================================================
@@ -1366,11 +1868,14 @@ with tab4:
         name = h1.text_input("Asset name", placeholder="e.g. Parag Parikh Flexi Cap")
         sleeve = h2.selectbox(
             "Sleeve", list(db.SLEEVES) + ["Transit (redeploying)", "Debt / Safety",
-                                          "Family (Parents)", "Family (Father)"],
+                                          "Family (Parents)", "Family (Father)",
+                                          EMERGENCY_SLEEVE],
             help="Transit = money with a landing date you'll redeploy (chits, short FDs). "
                  "Debt / Safety / Family (Parents) = locked safety floor (EPF, post "
                  "office, NSCs) outside growth targets. Family (Father) = his MF, "
-                 "counted as growth (one-household doctrine).",
+                 "counted as growth (one-household doctrine). "
+                 f"{EMERGENCY_SLEEVE} = liquid buffer (bank/liquid-fund/sweep-FD) — its "
+                 "own layer, feeds the Deploy tab's emergency line automatically.",
         )
         atype = h3.selectbox(
             "Type", ["mf", "stock", "global", "crypto", "manual"],
@@ -1405,7 +1910,8 @@ with tab4:
 
     st.markdown("##### Holdings — auto-priced, grouped by sleeve")
     st.caption("**Suggestion** chip: locked sleeves hold, Family (Father) keeps its SIP, "
-               "Transit needs redeploying, target sleeves compare current vs target % "
+               "Transit needs redeploying, Emergency (liquid) is goal-tracked not %-target, "
+               "target sleeves compare current vs target % "
                "(±20%/±50% bands — same rule as the Rebalance signal in Goals).")
     if holdings_df.empty:
         st.info("No holdings yet.")
