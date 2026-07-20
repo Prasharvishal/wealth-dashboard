@@ -67,6 +67,18 @@ INSTRUMENT_HINTS = {
     "Tactical / thematic": "Your thematic / sector bets (e.g. PSU, energy, momentum funds)",
 }
 
+# ONE-HOUSEHOLD layer doctrine (user decision 2026-07-20): no separate "family"
+# grouping. Ownership stays visible in each holding's NAME only — these two
+# non-target sleeve labels fold into the household's two real layers:
+#   "Family (Parents)" (the 6 NSCs held by parents) -> locked/safety layer,
+#     same bucket as "Debt / Safety" (EPF, post office) — guaranteed but
+#     pledge-able, not spendable, NOT an emergency fund.
+#   "Family (Father)" (his HDFC Mid-Cap MF)          -> growth/market layer,
+#     alongside the 7 target sleeves — it is a real market asset that should
+#     count toward net worth growth and (if ever tagged) sleeve gap math.
+SAFETY_LAYER_SLEEVES = {"Debt / Safety", "Family (Parents)"}
+GROWTH_EXTRA_SLEEVES = {"Family (Father)"}  # counts as growth but has no target %
+
 # Soft, modern CSS polish — rounded cards, breathing room, mobile friendly.
 st.markdown(
     """
@@ -265,6 +277,31 @@ def context_badge(mc, sleeve):
     return f" · 📊 {base} ({note})"
 
 
+def suggestion_chip(sleeve, sleeve_pct, target_pct):
+    """Per-holding suggestion chip: (label, reason) for the Holdings table.
+
+    Locked sleeves never get a rebalance opinion — they're outside the growth
+    plan by design. Family (Father) always says continue-SIP (never break the
+    best compounder in the house to prepay). Transit money is dateless once it
+    lands, so it always needs a destination. Everything else compares its
+    sleeve's current % against target using the same ±deviation bands as the
+    Rebalance signal (Codex 082 doctrine: gaps decide priority, not opinion).
+    """
+    if sleeve in ("Debt / Safety", "Family (Parents)"):
+        return "HOLD · locked", "guaranteed but locked — pledge-able, not spendable"
+    if sleeve == "Family (Father)":
+        return "CONTINUE SIP", "best compounder in the house — never break to prepay"
+    if sleeve == "Transit (redeploying)":
+        return "REDEPLOY", "dated money awaiting its landing-plan destination"
+    if target_pct is None:
+        return "HOLD", "no target set for this sleeve yet"
+    if sleeve_pct < target_pct * 0.8:
+        return "INCREASE", f"sleeve at {sleeve_pct:.0f}% vs {target_pct:.0f}% target — underweight"
+    if sleeve_pct > target_pct * 1.5:
+        return "PAUSE", f"sleeve at {sleeve_pct:.0f}% vs {target_pct:.0f}% target — overweight"
+    return "HOLD", f"sleeve near target ({sleeve_pct:.0f}% vs {target_pct:.0f}%)"
+
+
 def upcoming_events(df):
     """Date-aware money radar: maturities from holdings + the monthly review ritual.
 
@@ -297,8 +334,11 @@ def upcoming_events(df):
 def sleeve_breakdown(df):
     """Current value per sleeve + target % comparison. Returns DataFrame."""
     targets = dict(db.get_target_allocation())
-    # Growth/investable total = target sleeves only; Debt/Safety etc. sit outside.
-    total = (df.loc[df["Sleeve"].isin(targets), "Value"].sum() if not df.empty else 0.0)
+    # Growth/investable total = target sleeves + one-household growth extras
+    # (e.g. "Family (Father)" MF — a real market asset with no target % of its
+    # own yet). Debt/Safety and Family (Parents) sit outside, in the locked layer.
+    _growth_sleeves = set(targets) | GROWTH_EXTRA_SLEEVES
+    total = (df.loc[df["Sleeve"].isin(_growth_sleeves), "Value"].sum() if not df.empty else 0.0)
     data = []
     for sleeve, tgt in db.get_target_allocation():
         cur_val = df.loc[df["Sleeve"] == sleeve, "Value"].sum() if not df.empty else 0.0
@@ -355,6 +395,34 @@ def deploy_plan(amount, sleeve_df, growth_total, mode="rebalance"):
         return [(s, gaps[s] + remainder * tgt_w(s)) for s in db.SLEEVES]
     # Not enough to fully rebalance — distribute proportionally to the gaps.
     return [(s, amount * gaps[s] / gap_sum) for s in db.SLEEVES]
+
+
+# Emergency-first waterfall constants (Sentinel doctrine, app_state["sentinel_manifest"]
+# carries the live values when present; these are the fallback if that key is absent).
+EMERGENCY_FLOOR_DEFAULT = 360_000.0   # 6x expenses floor — first thing every deployment fills
+EMERGENCY_GOAL_DEFAULT = 1_200_000.0  # Vault goal, keeps growing after the floor
+SMALLCAP_SATELLITE_AMT = 7_500.0      # one optional smallcap pick when the DS slice is big enough
+SMALLCAP_MIN_DS_SLICE = 15_000.0      # Direct Stocks slice must be at least this to spare a satellite
+
+
+def emergency_first_plan(amount, emergency_balance, sleeve_df, growth_total,
+                         emergency_floor=EMERGENCY_FLOOR_DEFAULT, mode="rebalance"):
+    """Split a fresh deployment: emergency buffer first, then sleeve gaps.
+
+    Doctrine (2026-07-20): 50% of any deployment routes to the LIQUID emergency
+    buffer until `emergency_floor` (₹3.6L) exists; the remainder follows the
+    existing sleeve-gap math (deploy_plan). Once the floor is met, 100% of the
+    amount goes to sleeve gaps — the emergency line simply doesn't appear.
+
+    Returns (emergency_amount, sleeve_plan) where sleeve_plan is the same
+    list[(sleeve, rupee)] shape deploy_plan returns, sized off the post-
+    emergency remainder.
+    """
+    shortfall = max(0.0, emergency_floor - emergency_balance)
+    emergency_amount = min(round(amount * 0.5), shortfall) if shortfall > 0 else 0.0
+    remainder = amount - emergency_amount
+    sleeve_plan = deploy_plan(remainder, sleeve_df, growth_total, mode)
+    return emergency_amount, sleeve_plan
 
 
 def latest_cashflow():
@@ -452,12 +520,22 @@ fi_inp = FIInputs(
 )
 base_result = project(fi_inp)  # 10% baseline-ish (uses stored return default)
 _tgt_sleeves = dict(db.get_target_allocation())
-_non_tgt = (holdings_df.loc[~holdings_df["Sleeve"].isin(_tgt_sleeves)]
-            if not holdings_df.empty else holdings_df)
-transit_value = (_non_tgt.loc[_non_tgt["Sleeve"] == "Transit (redeploying)", "Value"].sum()
-                 if _non_tgt is not None and not _non_tgt.empty else 0.0)
-safety_value = ((_non_tgt["Value"].sum() if _non_tgt is not None and not _non_tgt.empty else 0.0)
-                - transit_value)
+# One-household layer split (Codex/user doctrine 2026-07-20): every holding
+# lands in exactly ONE of three buckets — growth (net_worth_growth, computed
+# in sleeve_breakdown above from target sleeves + GROWTH_EXTRA_SLEEVES),
+# transit (dated, awaiting redeployment), or the locked safety floor
+# (Debt/Safety + Family (Parents) NSCs). Explicit membership sets avoid the
+# old "everything not a target sleeve" catch-all, which orphaned/double-counted
+# non-target growth sleeves like Family (Father).
+_growth_sleeves = set(_tgt_sleeves) | GROWTH_EXTRA_SLEEVES
+transit_value = (holdings_df.loc[holdings_df["Sleeve"] == "Transit (redeploying)", "Value"].sum()
+                 if not holdings_df.empty else 0.0)
+safety_value = (holdings_df.loc[holdings_df["Sleeve"].isin(SAFETY_LAYER_SLEEVES), "Value"].sum()
+                if not holdings_df.empty else 0.0)
+_unmapped_sleeves = (sorted(set(holdings_df["Sleeve"].unique())
+                            - _growth_sleeves - SAFETY_LAYER_SLEEVES
+                            - {"Transit (redeploying)"})
+                     if not holdings_df.empty else [])
 # Household total: EPF already sits inside safety_value (holdings rows), so add
 # only the EXPLICIT pf/nps settings here — never the holdings-derived feed —
 # or EPF would be counted twice.
@@ -488,10 +566,16 @@ if _pf_conflict:
         "holdings rows ONLY and ignoring the setting. Fix one: set 'PF current' to 0 in the "
         "FI tab, or delete the EPF holdings rows. PF lives in ONE place, never both."
     )
+if _unmapped_sleeves:
+    st.warning(
+        f"⚠ Sleeve(s) not mapped to a layer, excluded from Net Worth: "
+        f"{', '.join(_unmapped_sleeves)}. Add them to GROWTH_EXTRA_SLEEVES or "
+        "SAFETY_LAYER_SLEEVES in app.py, or fix the sleeve name."
+    )
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Net Worth", fmt_inr(total_net_worth),
-          help="Growth sleeve + transit + safety floor (EPF, post office)")
+          help="Growth sleeve + transit + safety floor (EPF, post office, all NSCs)")
 k2.metric("Savings Rate", f"{savings_rate:.0f}%",
           help="Investable ÷ (investable + expenses), latest month")
 k3.metric("FI Progress", f"{base_result.fi_progress_pct:.0f}%",
@@ -640,16 +724,30 @@ Then explore the other tabs whenever you like:
 # ===========================================================================
 with tab_deploy:
     st.markdown("##### 💸 Deploy this month's money")
-    st.caption("Type what you have to invest this month — get the exact rupee "
-               "split per sleeve. This is your monthly action list.")
+    st.caption("The complete waterfall: **① emergency buffer → ② sleeve gaps → "
+               "③ scanner stock + optional smallcap satellite.** One plan, in order.")
 
-    dc1, dc2 = st.columns([1, 1.4])
+    # Sentinel manifest (app_state) can override the doctrine constants; falls
+    # back to the hardcoded defaults if the key/table isn't there yet.
+    _manifest = db.get_app_state("sentinel_manifest")
+    _em_floor = float(_manifest.get("emergency_floor") or EMERGENCY_FLOOR_DEFAULT)
+    _em_goal = float(_manifest.get("emergency_goal") or EMERGENCY_GOAL_DEFAULT)
+
+    dc1, dc2, dc3 = st.columns([1, 1, 1.3])
     with dc1:
         amt = st.number_input("Amount to invest this month (₹)", min_value=0.0,
                               value=float(investable or 100000), step=10000.0)
     with dc2:
+        em_bal = st.number_input(
+            "Liquid emergency money you already hold (₹)", min_value=0.0,
+            value=float(st.session_state.get("deploy_em_balance", 0.0)), step=10000.0,
+            help="Bank / liquid-fund / sweep-FD balance — the TRUE liquid buffer. "
+                 "EPF and NSCs don't count; they're locked.",
+            key="deploy_em_balance",
+        )
+    with dc3:
         mode_label = st.radio(
-            "How to split it",
+            "How to split the sleeve portion",
             ["Smart — rebalance-aware (recommended)", "Simple — pure target %"],
             help="Smart steers new money into whichever sleeves are below target, "
                  "so you rebalance without selling. With no holdings yet, both "
@@ -657,40 +755,81 @@ with tab_deploy:
         )
     mode = "rebalance" if mode_label.startswith("Smart") else "simple"
 
-    plan = deploy_plan(amt, sleeve_df, net_worth_growth, mode)
+    em_amount, sleeve_plan = emergency_first_plan(
+        amt, em_bal, sleeve_df, net_worth_growth, _em_floor, mode)
     tgt_map = dict(db.get_target_allocation())
 
-    plan_rows = [{
-        "Sleeve": s,
-        "Target %": f"{tgt_map.get(s, 0):.0f}%",
-        "Invest now": fmt_full_inr(a),
-        "What to buy": INSTRUMENT_HINTS.get(s, ""),
-    } for s, a in plan]
+    # Each entry: (label, why, rupee amount, color-tag). color-tag drives the
+    # bar chart below without re-parsing formatted strings.
+    _plan = []
+    if em_amount > 0:
+        _plan.append((
+            "🚨 Emergency fund — liquid MF / sweep-FD",
+            (f"you hold {fmt_inr(em_bal)} of the {fmt_inr(_em_floor)} floor "
+             f"(Vault goal {fmt_inr(_em_goal)}) — safety before markets"),
+            em_amount, GOLD))
+    for s, a in sleeve_plan:
+        if a < 500:
+            continue
+        _plan.append((f"{s} — {INSTRUMENT_HINTS.get(s, '')}", f"target {tgt_map.get(s, 0):.0f}%",
+                      a, SLEEVE_COLORS.get(s, MUTED)))
+
+    # Within the Direct Stocks slice: scanner #1 pick + optional smallcap satellite.
+    _ds_amount = dict(sleeve_plan).get("Direct Stocks", 0.0)
+    _scanner = db.get_app_state("scanner")
+    _core = _scanner.get("core") or []
+    _small = _scanner.get("smallcap") or []
+    if _ds_amount >= 500:
+        _ds_core_amount = _ds_amount
+        if _ds_amount >= SMALLCAP_MIN_DS_SLICE and _small:
+            _sat = _small[0]
+            _ds_core_amount = _ds_amount - SMALLCAP_SATELLITE_AMT
+            _plan.append((
+                f"🧪 {_sat.get('sym', '?')} — smallcap satellite (score {_sat.get('score', '?')})",
+                "⚠ experiment: ₹25k total cap · kill line −30%/name · judgment pass FIRST",
+                SMALLCAP_SATELLITE_AMT, RED))
+        if _core:
+            _pick = _core[0]
+            _plan.append((
+                f"{_pick.get('sym', '?')} — scanner #1 (score {_pick.get('score', '?')})",
+                "Direct Stocks sleeve · max ONE new name/month · ⚠ judgment pass FIRST",
+                _ds_core_amount, SLEEVE_COLORS.get("Direct Stocks", MUTED)))
+
+    plan_rows = [{"Destination": lbl, "Why": why, "Amount": fmt_full_inr(a)}
+                 for lbl, why, a, _c in _plan]
     st.dataframe(pd.DataFrame(plan_rows), use_container_width=True, hide_index=True)
 
-    total_alloc = sum(a for _, a in plan)
+    total_alloc = sum(a for _, _, a, _c in _plan)
     st.caption(f"Total deployed: **{fmt_full_inr(total_alloc)}**  ·  "
                f"PF ₹{s_float('pf_monthly', 37500):,.0f} + "
                f"NPS ₹{s_float('nps_monthly', 10000):,.0f} go in separately.")
+    if _core or _small:
+        st.warning("⚠ Stock lines are candidates, not recommendations — run the judgment "
+                   "pass (news / governance / thesis via Claude) before buying either one.")
 
     # Visual: horizontal bar of the rupee split.
-    if amt > 0:
+    if amt > 0 and _plan:
         pf_fig = go.Figure(go.Bar(
-            x=[a for _, a in plan],
-            y=[s for s, _ in plan],
+            x=[a for _, _, a, _c in _plan],
+            y=[lbl[:36] for lbl, _w, _a, _c in _plan],
             orientation="h",
-            marker_color=[SLEEVE_COLORS.get(s, MUTED) for s, _ in plan],
-            text=[fmt_full_inr(a) for _, a in plan],
+            marker_color=[c for _l, _w, _a, c in _plan],
+            text=[fmt_full_inr(a) for _, _, a, _c in _plan],
             textposition="auto",
         ))
         pf_fig.update_layout(
-            template="plotly_dark", height=320,
+            template="plotly_dark", height=max(320, 40 * len(_plan)),
             margin=dict(t=10, b=10, l=10, r=10),
             xaxis_title="₹ this month", yaxis=dict(autorange="reversed"),
         )
         st.plotly_chart(pf_fig, use_container_width=True)
 
-    if mode == "rebalance" and net_worth_growth > 0:
+    if em_amount > 0:
+        st.info(f"ℹ️ **Emergency-first**: half of this deployment ({fmt_inr(em_amount)}) "
+                f"tops up your liquid buffer before anything else — "
+                f"{fmt_inr(max(0.0, _em_floor - em_bal - em_amount))} still short of the "
+                f"{fmt_inr(_em_floor)} floor.")
+    elif mode == "rebalance" and net_worth_growth > 0:
         st.info("ℹ️ **Smart mode** is funneling more into your under-weight "
                 "sleeves first, so your portfolio drifts back toward target "
                 "without you selling anything.")
@@ -698,6 +837,49 @@ with tab_deploy:
         st.info("ℹ️ No holdings yet, so this is a clean target-weight split. "
                 "Once you own things, **Smart mode** will tilt new money toward "
                 "whatever is lagging.")
+
+    st.divider()
+    st.markdown("##### 🔎 Stock scanner — Codex-081 quantitative screen")
+    st.caption("Nifty 500 quality/growth screen + Smallcap-250 satellite experiment · "
+               "**advisory only, two-stage**: this screen shortlists → ask Claude for "
+               "the judgment pass (news · governance · thesis) before any buy.")
+    if not _core and not _small:
+        st.info("No scan on file yet — the Sentinel dashboard pushes this at each "
+                "regeneration (`dt_system/dashboard_update.py`).")
+    else:
+        _gen = _scanner.get("generated") or _scanner.get("_updated") or "?"
+        _spec = _scanner.get("spec")
+        st.caption(f"Scanned **{_gen}**" + (f" · spec: {_spec}" if _spec else ""))
+        _stats = _scanner.get("stats") or {}
+        if _core:
+            st.markdown(f"**CORE** · Nifty 500 · "
+                        f"{_stats.get('core_passed', '?')}/{_stats.get('core_universe', 500)} "
+                        f"passed all quality gates — top 15 shown")
+            _core_rows = [{
+                "Sym": r.get("sym"), "Name": r.get("name"), "Sector": r.get("sector"),
+                "Price": fmt_full_inr(r.get("price", 0)), "ROE %": r.get("roe_pct"),
+                "Rev gr %": r.get("rev_g_pct"), "Earn gr %": r.get("earn_g_pct"),
+                "D/E": r.get("de"), "RS 6m %": r.get("rs6m_pct"), "Score": r.get("score"),
+            } for r in _core[:15]]
+            st.dataframe(pd.DataFrame(_core_rows), use_container_width=True, hide_index=True)
+        st.markdown(f"🧪 **SMALLCAP SATELLITE** · Smallcap 250 · "
+                    f"{_stats.get('small_passed', '?')}/{_stats.get('small_universe', 250)} "
+                    f"passed · EXPERIMENT: low prior, ₹25k total cap, ₹5–10k/name, "
+                    f"kill line −30%/name, graded at N=10")
+        if _small:
+            _small_rows = [{
+                "Sym": r.get("sym"), "Name": r.get("name"), "Sector": r.get("sector"),
+                "Price": fmt_full_inr(r.get("price", 0)), "ROE %": r.get("roe_pct"),
+                "Rev gr %": r.get("rev_g_pct"), "RS 6m %": r.get("rs6m_pct"),
+                "Score": r.get("score"),
+            } for r in _small]
+            st.dataframe(pd.DataFrame(_small_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Nothing passed the smallcap gates this scan — correct behaviour, "
+                       "not a bug. The gates stay put.")
+        st.warning("⚠ **Two-stage discipline**: these are quantitative candidates, NOT "
+                   "recommendations. Every name needs the judgment pass — news, "
+                   "governance, thesis — via Claude before any order goes in.")
 
 
 # ===========================================================================
@@ -708,8 +890,9 @@ with tab1:
     c1.metric("Total Net Worth", fmt_inr(total_net_worth))
     c2.metric("Growth Sleeve", fmt_inr(net_worth_growth))
     c3.metric("🛡 Safety Floor", fmt_inr(safety_value),
-              help="EPF (both of you) + post office — permanent, outside market plans. "
-                   "EPF also feeds the FI projection's PF engine automatically.")
+              help="EPF (both of you) + post office + all 7 NSCs (incl. parents') — "
+                   "guaranteed but LOCKED: pledge-able, not spendable, NOT an emergency "
+                   "fund. EPF also feeds the FI projection's PF engine automatically.")
 
     # Money timeline — the app taps your shoulder as dated events approach.
     _evs = [e for e in upcoming_events(holdings_df) if -3 <= e["days"] <= 140]
@@ -741,7 +924,7 @@ with tab1:
                 for e in _soon))
 
     st.markdown("##### Allocation — current vs target (growth sleeve)")
-    st.caption(f"🛡 Permanent safety floor (EPF, post office): {fmt_inr(safety_value)}  ·  "
+    st.caption(f"🛡 Locked-in base (EPF, post office, all NSCs): {fmt_inr(safety_value)}  ·  "
                f"⏳ Transit, redeploying Jul–Aug 26 (chits, small FDs): {fmt_inr(transit_value)}  ·  "
                f"Household total: {fmt_inr(total_net_worth)}")
     left, right = st.columns([1, 1])
@@ -791,6 +974,41 @@ with tab1:
     disp["Target %"] = disp["Target %"].map(lambda v: f"{v:.0f}%")
     disp["Deviation"] = disp["Deviation"].map(lambda v: f"{v:+.1f}pp")
     st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("##### 🏦 Loans & EMIs")
+    st.caption("Cash-flow only — these financed the (off-balance) land, so outstanding "
+               "principal is **never subtracted** from the investment totals above.")
+    liabilities = db.get_liabilities()
+    if not liabilities:
+        st.info("No loans recorded.")
+    else:
+        loan_rows = []
+        total_emi = 0.0
+        for l in liabilities:
+            prov = (l.get("provenance") or "")
+            flag = "⚠ estimate" if "estimated" in prov.lower() else "confirmed"
+            emi = l.get("emi") or 0.0
+            total_emi += emi
+            loan_rows.append({
+                "Loan": l.get("name") or "?",
+                "Lender": l.get("lender") or "—",
+                "Outstanding": fmt_inr(l.get("outstanding") or 0),
+                "Rate": f"{l.get('rate_pct'):.1f}%" if l.get("rate_pct") is not None else "—",
+                "EMI/mo": fmt_inr(emi),
+                "Provenance": flag,
+            })
+        st.dataframe(pd.DataFrame(loan_rows), use_container_width=True, hide_index=True)
+        total_outstanding = sum(l.get("outstanding") or 0 for l in liabilities)
+        lc1, lc2 = st.columns(2)
+        lc1.metric("Total outstanding", fmt_inr(total_outstanding))
+        lc2.metric("Combined EMI/mo", fmt_inr(total_emi))
+        st.caption(
+            "🏡 These loans financed the off-balance land — shown here as **cash-flow "
+            "only**, never netted against your investments. Collateral / payoff path: "
+            "parents' NSCs mature **₹36.2L across 2029–31**, timed to cover the loans "
+            "as they wind down."
+        )
 
 
 # ===========================================================================
@@ -992,9 +1210,12 @@ with tab4:
         h1, h2, h3 = st.columns(3)
         name = h1.text_input("Asset name", placeholder="e.g. Parag Parikh Flexi Cap")
         sleeve = h2.selectbox(
-            "Sleeve", list(db.SLEEVES) + ["Transit (redeploying)", "Debt / Safety"],
+            "Sleeve", list(db.SLEEVES) + ["Transit (redeploying)", "Debt / Safety",
+                                          "Family (Parents)", "Family (Father)"],
             help="Transit = money with a landing date you'll redeploy (chits, short FDs). "
-                 "Debt / Safety = permanent floor (EPF, post office) outside growth targets.",
+                 "Debt / Safety / Family (Parents) = locked safety floor (EPF, post "
+                 "office, NSCs) outside growth targets. Family (Father) = his MF, "
+                 "counted as growth (one-household doctrine).",
         )
         atype = h3.selectbox(
             "Type", ["mf", "stock", "global", "crypto", "manual"],
@@ -1028,17 +1249,24 @@ with tab4:
                 st.error("Need at least an asset name and quantity > 0.")
 
     st.markdown("##### Holdings — auto-priced, grouped by sleeve")
+    st.caption("**Suggestion** chip: locked sleeves hold, Family (Father) keeps its SIP, "
+               "Transit needs redeploying, target sleeves compare current vs target % "
+               "(±20%/±50% bands — same rule as the Rebalance signal in Goals).")
     if holdings_df.empty:
         st.info("No holdings yet.")
     else:
         _extra_sleeves = sorted(s for s in holdings_df["Sleeve"].unique()
                                 if s not in db.SLEEVES)
+        _sleeve_pct = {r["Sleeve"]: r["Current %"] for _, r in sleeve_df.iterrows()}
+        _sleeve_tgt = {r["Sleeve"]: r["Target %"] for _, r in sleeve_df.iterrows()}
         for sleeve in list(db.SLEEVES) + _extra_sleeves:
             sdf = holdings_df[holdings_df["Sleeve"] == sleeve]
             if sdf.empty:
                 continue
             sval = sdf["Value"].sum()
-            st.markdown(f"**{sleeve}** — {fmt_inr(sval)}")
+            _chip, _reason = suggestion_chip(
+                sleeve, _sleeve_pct.get(sleeve), _sleeve_tgt.get(sleeve))
+            st.markdown(f"**{sleeve}** — {fmt_inr(sval)}  ·  `{_chip}` — {_reason}")
             view = sdf.copy()
             view["Value"] = view["Value"].map(fmt_inr)
             view["Cost"] = view["Cost"].map(fmt_inr)
@@ -1049,8 +1277,9 @@ with tab4:
             view["CAGR %"] = view["CAGR %"].map(
                 lambda v: f"{v:+.1f}%" if pd.notna(v) else "—")
             view["Stale"] = view["Stale"].map(lambda v: "⚠" if v else "")
+            view["Suggestion"] = _chip
             cols = ["Asset", "Qty", "Buy", "Price", "Value", "Cost",
-                    "P/L", "P/L %", "CAGR %", "Source", "Stale", "Age"]
+                    "P/L", "P/L %", "CAGR %", "Suggestion", "Source", "Stale", "Age"]
             if view["Maturity"].notna().any():
                 view["Lands"] = view.apply(
                     lambda r: (f"⏳ {(datetime.fromisoformat(str(r['Maturity'])).date() - datetime.now().date()).days}d"
@@ -1124,8 +1353,9 @@ with tab5:
                          f"  → landing plan on arrival: {_plan}. "
                          f"Lock this on paper before the money arrives.")
         if safety_value > 0:
-            _tips.append(f"🛡 **Permanent safety floor** {fmt_inr(safety_value)} (EPF, post "
-                         f"office) stays outside growth targets — by design, untouched.")
+            _tips.append(f"🛡 **Locked-in base** {fmt_inr(safety_value)} (EPF, post office, "
+                         f"all 7 NSCs incl. parents') stays outside growth targets — "
+                         f"guaranteed but locked, not spendable, by design untouched.")
         _tips.append("_Rules: cash-flow rebalancing (new money → underweight sleeves; "
                      "selling = last resort) · 5% deviation band · Direct Stocks governed "
                      "by the monthly rulebook review._")

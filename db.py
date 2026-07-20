@@ -382,3 +382,35 @@ def upsert_goal(name, target_amount, kind, goal_id=None):
 
 def delete_goal(goal_id):
     execute("DELETE FROM goals WHERE id = ?", (goal_id,))
+
+
+# ---------------------------------------------------------------------------
+# Liabilities (loans/EMIs — cash-flow only, never netted against investments)
+# ---------------------------------------------------------------------------
+def get_liabilities():
+    """All loan rows, or [] if the table doesn't exist yet on an older DB."""
+    try:
+        return query("SELECT * FROM liabilities ORDER BY outstanding DESC")
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# App state (Sentinel -> Vault sync channel; key/value JSON blobs)
+# ---------------------------------------------------------------------------
+def get_app_state(key):
+    """One app_state row's JSON value, decoded to a dict, or {} if absent/missing table."""
+    try:
+        row = query_one("SELECT value, updated FROM app_state WHERE key = ?", (key,))
+    except Exception:
+        return {}
+    if not row or not row.get("value"):
+        return {}
+    try:
+        import json
+        data = json.loads(row["value"])
+        if isinstance(data, dict):
+            data.setdefault("_updated", row.get("updated"))
+        return data
+    except Exception:
+        return {}
