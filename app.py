@@ -1430,19 +1430,16 @@ with tab1:
         )
 
     # ---- Feature C: liabilities editor (2026-07-20) -----------------------
-    # Schema note (verified against the live query in dt_system/wealth_pull.py):
-    # the liabilities table's confirmed columns are name, outstanding, emi,
-    # rate_pct, tenure_months, provenance. There is no lender / principal /
-    # start_date column on the live table today. The add-loan form below still
-    # takes lender/principal/start_date as inputs (matching the request) but
-    # only writes the 6 confirmed columns to the DB — the caption makes that
-    # explicit rather than silently dropping what you typed.
+    # Full-column persistence (schema corrected same day against the live
+    # DB's sqlite_master DDL — see the schema-history note in db.py): name,
+    # lender, principal, outstanding, rate_pct, emi, tenure_months,
+    # start_date, provenance. `principal` is NOT NULL on the live table, so
+    # the add-loan form REQUIRES it — a blank/0 principal falls back to the
+    # outstanding amount (a fresh loan starts with the two equal). Existing-
+    # loan edits stay limited to outstanding / EMI / rate / provenance —
+    # enough for the monthly pass; the other columns are set at creation.
     with st.expander("✏️ Edit loans"):
         liabilities = db.get_liabilities()
-        st.caption("⚠ Live schema currently stores **name, outstanding, EMI, rate, "
-                   "tenure (months), provenance** only — lender/principal/start-date "
-                   "aren't persisted columns yet even though the add-loan form below "
-                   "takes them (kept for when the schema grows).")
         if liabilities:
             st.markdown("**Existing loans**")
             for l in liabilities:
@@ -1490,7 +1487,10 @@ with tab1:
             al1, al2, al3 = st.columns(3)
             al_name = al1.text_input("Name", placeholder="e.g. Home loan — SBI")
             al_lender = al2.text_input("Lender", placeholder="e.g. SBI")
-            al_principal = al3.number_input("Original principal (₹)", min_value=0.0, step=10000.0)
+            al_principal = al3.number_input(
+                "Original principal (₹) — required", min_value=0.0, step=10000.0,
+                help="NOT NULL on the live table. Leave 0 to default it to the "
+                     "outstanding amount (a fresh loan starts with the two equal).")
             al4, al5, al6 = st.columns(3)
             al_outstanding = al4.number_input("Outstanding (₹)", min_value=0.0, step=10000.0)
             al_rate = al5.number_input("Rate (%)", min_value=0.0, max_value=50.0,
@@ -1500,26 +1500,27 @@ with tab1:
             al_tenure = al7.number_input("Tenure (months)", min_value=0, step=1)
             al_start = al8.date_input("Start date", value=datetime.now())
             if st.form_submit_button("➕ Add loan", use_container_width=True):
-                if al_name and al_outstanding >= 0:
-                    # Review fix: st.number_input ALWAYS returns a number
-                    # (never blank/None) — `x or None` was turning a
+                # principal is NOT NULL on the live table: required here, with
+                # outstanding as the sensible default when left at 0.
+                _al_principal = al_principal if al_principal > 0 else al_outstanding
+                if al_name and al_outstanding >= 0 and _al_principal > 0:
+                    # Note: st.number_input ALWAYS returns a number (never
+                    # blank/None) — pass raw values straight through so a
                     # legitimate 0 (0% interest-free loan, 0 months tenure
-                    # remaining) into NULL. Pass the raw values straight
-                    # through; there is no "unset" case to coerce here.
+                    # remaining) is stored as 0, not coerced to NULL.
                     db.add_liability(
-                        al_name, al_outstanding, emi=al_emi,
-                        rate_pct=al_rate,
+                        al_name, al_outstanding, principal=_al_principal,
+                        lender=(al_lender.strip() or None),
+                        start_date=str(al_start) if al_start else None,
+                        emi=al_emi, rate_pct=al_rate,
                         tenure_months=int(al_tenure),
                         provenance="user-entered",
                     )
-                    st.success(
-                        f"Added {al_name}. (lender={al_lender or '—'}, "
-                        f"principal={fmt_inr(al_principal)}, start={al_start} — "
-                        "noted here but not yet persisted; see the schema caption above.)"
-                    )
+                    st.success(f"Added {al_name}.")
                     st.rerun()
                 else:
-                    st.error("Need at least a name and outstanding ≥ 0.")
+                    st.error("Need a name, outstanding ≥ 0, and a principal > 0 "
+                             "(principal defaults to the outstanding amount if left 0).")
 
 
 # ===========================================================================

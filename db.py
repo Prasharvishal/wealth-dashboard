@@ -168,6 +168,13 @@ def pull():
 
 # ---------------------------------------------------------------------------
 # Backend-neutral query helpers (return plain dict rows from either backend)
+#
+# SQLite paths close their connection in try/finally (fix 2026-07-20): the
+# old shape ran `conn.close()` after the statement, so a FAILING statement
+# (e.g. a NOT NULL violation on liabilities.principal) raised past the close
+# and leaked the connection with an open transaction — every later local
+# write in the same process then died "database is locked". Turso paths are
+# untouched (stateless HTTP, no connection to leak).
 # ---------------------------------------------------------------------------
 def query(sql, params=()):
     """Run a SELECT, return list[dict]."""
@@ -177,12 +184,13 @@ def query(sql, params=()):
             cols = list(rs.columns)
             return [{cols[i]: row[i] for i in range(len(cols))} for row in rs.rows]
         conn = _get_sqlite()
-        cur = conn.cursor()
-        cur.execute(sql, params)
-        cols = [d[0] for d in cur.description] if cur.description else []
-        out = [dict(zip(cols, r)) for r in cur.fetchall()]
-        conn.close()
-        return out
+        try:
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            cols = [d[0] for d in cur.description] if cur.description else []
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+        finally:
+            conn.close()
 
 
 def query_one(sql, params=()):
@@ -197,11 +205,13 @@ def query_scalar(sql, params=()):
             rs = _TURSO_CLIENT.execute(sql, list(params))
             return rs.rows[0][0] if rs.rows else None
         conn = _get_sqlite()
-        cur = conn.cursor()
-        cur.execute(sql, params)
-        row = cur.fetchone()
-        conn.close()
-        return row[0] if row else None
+        try:
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            row = cur.fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
 
 
 def execute(sql, params=()):
@@ -211,10 +221,12 @@ def execute(sql, params=()):
             _TURSO_CLIENT.execute(sql, list(params))  # HTTP autocommits
             return
         conn = _get_sqlite()
-        cur = conn.cursor()
-        cur.execute(sql, params)
-        conn.commit()
-        conn.close()
+        try:
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def executemany(sql, seq):
@@ -225,11 +237,13 @@ def executemany(sql, seq):
                 _TURSO_CLIENT.execute(sql, list(params))
             return
         conn = _get_sqlite()
-        cur = conn.cursor()
-        for params in seq:
-            cur.execute(sql, params)
-        conn.commit()
-        conn.close()
+        try:
+            cur = conn.cursor()
+            for params in seq:
+                cur.execute(sql, params)
+            conn.commit()
+        finally:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -398,21 +412,46 @@ def delete_goal(goal_id):
 # ---------------------------------------------------------------------------
 # Liabilities (loans/EMIs — cash-flow only, never netted against investments)
 # ---------------------------------------------------------------------------
-# Schema note: this table was created directly against the live Turso DB
+# Schema history: this table was created directly against the live Turso DB
 # (dt_system OPEN_ITEMS C10, 2026-07-20) — there is no CREATE TABLE for it in
-# this repo's history. Confirmed live columns (dt_system/wealth_pull.py's
-# working SELECT): name, outstanding, emi, rate_pct, tenure_months,
-# provenance. The IF NOT EXISTS below matches that confirmed shape exactly
-# (plus an id PK) so it's a true no-op against the real Turso table and only
-# helps a fresh local-SQLite install start from the same schema.
-LIABILITY_COLS = ("name", "outstanding", "emi", "rate_pct", "tenure_months", "provenance")
+# this repo's history. A first pass here inferred a 6-column shape from
+# dt_system/wealth_pull.py's SELECT projection; that inference was WEAK — a
+# SELECT naming 6 columns proves those 6 EXIST, not that others don't.
+# Corrected same day from the live DB's sqlite_master DDL (queried live by
+# the session coordinator; this repo's env has no Turso credentials to
+# re-run it — verbatim DDL below). Note `principal REAL NOT NULL`: an INSERT
+# that omits principal does not degrade gracefully, it fails the whole
+# statement — which is why add_liability REQUIRES it.
+#
+#   CREATE TABLE liabilities (id INTEGER PRIMARY KEY AUTOINCREMENT,
+#     name TEXT NOT NULL, lender TEXT, principal REAL NOT NULL,
+#     outstanding REAL NOT NULL, rate_pct REAL, emi REAL,
+#     tenure_months INTEGER, start_date TEXT, provenance TEXT)
+LIABILITY_COLS = ("name", "lender", "principal", "outstanding", "rate_pct",
+                  "emi", "tenure_months", "start_date", "provenance")
 
 
 def _ensure_liabilities_table():
+    # Mirrors the live DDL above (IF NOT EXISTS -> true no-op against Turso;
+    # only a fresh local-SQLite install actually creates anything here).
     execute("""CREATE TABLE IF NOT EXISTS liabilities (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL, outstanding REAL NOT NULL DEFAULT 0,
-        emi REAL, rate_pct REAL, tenure_months INTEGER, provenance TEXT)""")
+        name TEXT NOT NULL, lender TEXT, principal REAL NOT NULL,
+        outstanding REAL NOT NULL, rate_pct REAL, emi REAL,
+        tenure_months INTEGER, start_date TEXT, provenance TEXT)""")
+    # Local-only migrations: a wealth.db created by the earlier 6-column
+    # version of this DDL needs the 3 newer columns added. (SQLite can't ADD
+    # COLUMN with NOT NULL and no default, so principal migrates as plain
+    # REAL locally — the live Turso table already carries the real
+    # constraint.) Against live Turso every ALTER fails "duplicate column"
+    # and is swallowed — same idiom init_db uses for the holdings migrations.
+    for _mig in ("ALTER TABLE liabilities ADD COLUMN lender TEXT",
+                 "ALTER TABLE liabilities ADD COLUMN principal REAL",
+                 "ALTER TABLE liabilities ADD COLUMN start_date TEXT"):
+        try:
+            execute(_mig)
+        except Exception:
+            pass  # column already present
 
 
 def get_liabilities():
@@ -423,25 +462,36 @@ def get_liabilities():
         return []
 
 
-def add_liability(name, outstanding, emi=None, rate_pct=None, tenure_months=None,
-                   provenance="user-entered"):
-    """Insert one loan row. Writes ONLY the 6 columns confirmed live on Turso
-    (see note above) — no lender/principal/start_date columns exist there."""
+def add_liability(name, outstanding, principal, lender=None, start_date=None,
+                  emi=None, rate_pct=None, tenure_months=None,
+                  provenance="user-entered"):
+    """Insert one loan row — full live column set (see the DDL note above).
+
+    `principal` is REQUIRED: the live column is NOT NULL, so an INSERT that
+    omits it doesn't degrade to a partial row, it fails outright. Raise here
+    with a clear message rather than letting the constraint error surface."""
+    if principal is None:
+        raise ValueError("add_liability: principal is required "
+                         "(NOT NULL column on the live liabilities table)")
     _ensure_liabilities_table()
     execute(
-        "INSERT INTO liabilities (name, outstanding, emi, rate_pct, tenure_months, "
-        "provenance) VALUES (?, ?, ?, ?, ?, ?)",
-        (name, float(outstanding or 0), emi, rate_pct, tenure_months, provenance),
+        "INSERT INTO liabilities (name, lender, principal, outstanding, rate_pct, "
+        "emi, tenure_months, start_date, provenance) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (name, lender, float(principal), float(outstanding or 0), rate_pct,
+         emi, tenure_months, start_date, provenance),
     )
 
 
 def update_liability(liability_id, **fields):
-    """Update selected columns on one loan row. Drops any key not in
-    LIABILITY_COLS so a stray field can never crash the write against the
-    live table's real (narrower) column set — but raises if that leaves
-    NOTHING to write, rather than silently no-op'ing while the caller's UI
-    still reports success. Returns the number of rows affected (0 or 1) so
-    the caller can distinguish "updated" from "no row with that id"."""
+    """Update selected columns on one loan row. Accepts any of the 9 live
+    columns (LIABILITY_COLS — lender/principal/start_date included, though
+    the Vault UI currently only edits outstanding/emi/rate_pct/provenance).
+    Drops any key NOT in LIABILITY_COLS so a stray field can never crash the
+    write — but raises if that leaves NOTHING to write, rather than silently
+    no-op'ing while the caller's UI still reports success. Returns the number
+    of rows affected (0 or 1) so the caller can distinguish "updated" from
+    "no row with that id"."""
     fields = {k: v for k, v in fields.items() if k in LIABILITY_COLS}
     if not fields:
         raise ValueError(
