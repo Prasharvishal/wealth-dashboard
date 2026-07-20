@@ -240,17 +240,30 @@ def compute_holdings_table():
 
 
 def market_context():
-    """Live 'cheap or expensive vs its own 200-day average' per sleeve.
+    """Live 'cheap or expensive vs its own 200-day average' per sleeve, keyed by
+    the EXACT sleeve name so each sleeve only ever sees its own row.
 
     Rows are pushed into Turso by MAVI Sentinel twice daily (06:05 / 17:15 IST)
     from the same verified price feeds the watchers use. Informational ONLY:
     it never reorders targets or overrides the allocation rules — it tells you
     what kind of price you're paying when you deploy.
+
+    Fix 3 (2026-07-20): order by `updated` ASC so that if Sentinel ever leaves
+    more than one row for the same sleeve (a stale row alongside a fresh one),
+    the dict comprehension's last-write-wins keeps the MOST RECENT row, not
+    whichever happened to be returned last by an unordered SELECT. Sleeve keys
+    are also stripped so incidental whitespace can't create a silent mismatch.
+    Never falls back to a different sleeve's benchmark — a sleeve with no row
+    of its own gets no badge (see context_badge below).
     """
     try:
-        return {r["sleeve"]: r for r in db.query("SELECT * FROM market_context")}
+        rows = db.query("SELECT * FROM market_context ORDER BY updated ASC")
     except Exception:
-        return {}
+        try:
+            rows = db.query("SELECT * FROM market_context")  # no `updated` column
+        except Exception:
+            return {}
+    return {str(r["sleeve"]).strip(): r for r in rows if r.get("sleeve")}
 
 
 def context_badge(mc, sleeve):
@@ -259,8 +272,13 @@ def context_badge(mc, sleeve):
     Wording is deliberately NEUTRAL (Codex 082 ruling): state position vs the
     200-day average and trend state only — never imply cheap = attractive.
     Sleeve gaps decide priority; this line is context, not a signal.
+
+    Strict exact-sleeve lookup only (Fix 3, 2026-07-20) — a sleeve with no
+    matching market_context row (e.g. "Direct Stocks", which has no single
+    tradable benchmark) renders NO badge. Never borrows another sleeve's
+    benchmark (e.g. NIFTYBEES) just because one happens to be on file.
     """
-    r = mc.get(sleeve)
+    r = mc.get(str(sleeve).strip())
     if not r or r.get("dist_sma") is None:
         return ""
     d = float(r["dist_sma"])
@@ -332,13 +350,21 @@ def upcoming_events(df):
 
 
 def sleeve_breakdown(df):
-    """Current value per sleeve + target % comparison. Returns DataFrame."""
+    """Current value per sleeve + target % comparison. Returns (DataFrame, pool_total).
+
+    USER DECISION 2026-07-20 (Option A + concentration guard): the pool total is
+    TARGET SLEEVES ONLY. "Family (Father)" (GROWTH_EXTRA_SLEEVES) is a real market
+    asset with no target % of its own — it counts toward net worth and the
+    growth-layer summary (added on top of this pool at the call site), but it must
+    NEVER dilute the target-sleeve denominator. Before this fix, `total` mixed in
+    GROWTH_EXTRA_SLEEVES while the per-sleeve loop only ever summed target sleeves,
+    so every target sleeve's Current % was silently deflated (e.g. Global/US showed
+    ~55% on the donut but ~11% "underweight" in Current %/deviations — contradictory
+    numbers from one bug). This pool feeds Current %, Deviation, deploy_plan's
+    gap math, and the Goals & Rebalance priorities — all of it must agree.
+    """
     targets = dict(db.get_target_allocation())
-    # Growth/investable total = target sleeves + one-household growth extras
-    # (e.g. "Family (Father)" MF — a real market asset with no target % of its
-    # own yet). Debt/Safety and Family (Parents) sit outside, in the locked layer.
-    _growth_sleeves = set(targets) | GROWTH_EXTRA_SLEEVES
-    total = (df.loc[df["Sleeve"].isin(_growth_sleeves), "Value"].sum() if not df.empty else 0.0)
+    total = (df.loc[df["Sleeve"].isin(targets), "Value"].sum() if not df.empty else 0.0)
     data = []
     for sleeve, tgt in db.get_target_allocation():
         cur_val = df.loc[df["Sleeve"] == sleeve, "Value"].sum() if not df.empty else 0.0
@@ -351,6 +377,61 @@ def sleeve_breakdown(df):
             "Deviation": cur_pct - tgt,
         })
     return pd.DataFrame(data), total
+
+
+# Concentration-guard fallbacks (Fix 2, 2026-07-20 "Option A + concentration
+# guard" decision). app_state["sentinel_manifest"]["concentration_guard"]
+# overrides these when present: {threshold_pct, selfheal_note}.
+CONCENTRATION_THRESHOLD_DEFAULT = 40.0
+CONCENTRATION_SELFHEAL_DEFAULT = (
+    "Self-heals to ~40% by ~2031 at current flows (your ₹1L/mo outgrows it)."
+)
+
+
+def concentration_check(holdings_df, growth_total):
+    """Single-holding concentration inside the growth layer (target sleeves +
+    GROWTH_EXTRA_SLEEVES). Returns the single worst offender as a dict
+    {name, value, pct, threshold_pct, selfheal_note} if any ONE holding is
+    over threshold, else None.
+
+    Deliberately per-HOLDING, not per-sleeve: a sleeve can be within its target
+    band while still being dominated by one name (e.g. Family (Father)'s HDFC
+    Mid-Cap fund, which has no sleeve target at all — sleeve-level deviation
+    would never catch it). share = holding value / growth-layer total, where
+    growth-layer total is the SAME denominator as net_worth_growth (target
+    sleeves + GROWTH_EXTRA_SLEEVES), never the target-sleeve-only pool.
+    """
+    if holdings_df.empty or growth_total <= 0:
+        return None
+    targets = set(dict(db.get_target_allocation()))
+    growth_sleeves = targets | GROWTH_EXTRA_SLEEVES
+    gdf = holdings_df.loc[holdings_df["Sleeve"].isin(growth_sleeves)]
+    if gdf.empty:
+        return None
+
+    manifest = db.get_app_state("sentinel_manifest")
+    cg = manifest.get("concentration_guard") or {}
+    threshold = float(cg.get("threshold_pct") or CONCENTRATION_THRESHOLD_DEFAULT)
+    selfheal_note = cg.get("selfheal_note") or CONCENTRATION_SELFHEAL_DEFAULT
+
+    worst = None
+    for _, row in gdf.iterrows():
+        value = float(row["Value"] or 0.0)
+        pct = (value / growth_total * 100.0) if growth_total else 0.0
+        if pct > threshold and (worst is None or pct > worst["pct"]):
+            worst = {"name": row["Asset"], "value": value, "pct": pct,
+                     "threshold_pct": threshold, "selfheal_note": selfheal_note}
+    return worst
+
+
+def concentration_warning_text(hit):
+    """Render the standard concentration-guard banner text from a
+    concentration_check() hit dict."""
+    return (
+        f"⚠ Single-fund concentration: {hit['name']} = {hit['pct']:.0f}% of "
+        f"household market assets. {hit['selfheal_note']} Standing rule: your "
+        f"new money never buys midcap until this is <{hit['threshold_pct']:.0f}%."
+    )
 
 
 def deploy_plan(amount, sleeve_df, growth_total, mode="rebalance"):
@@ -403,6 +484,10 @@ EMERGENCY_FLOOR_DEFAULT = 360_000.0   # 6x expenses floor — first thing every 
 EMERGENCY_GOAL_DEFAULT = 1_200_000.0  # Vault goal, keeps growing after the floor
 SMALLCAP_SATELLITE_AMT = 7_500.0      # one optional smallcap pick when the DS slice is big enough
 SMALLCAP_MIN_DS_SLICE = 15_000.0      # Direct Stocks slice must be at least this to spare a satellite
+EMERGENCY_VEHICLES_DEFAULT = (
+    "Park in ONE liquid fund, direct-growth — e.g. ICICI Prudential Liquid, HDFC "
+    "Liquid, SBI Liquid — or a bank sweep-in FD. Reachable in 1 business day."
+)
 
 
 def emergency_first_plan(amount, emergency_balance, sleeve_df, growth_total,
@@ -480,7 +565,14 @@ check_auth()
 # HEADER + KPI ROW (shown above all tabs)
 # ===========================================================================
 holdings_df, any_stale = compute_holdings_table()
-sleeve_df, net_worth_growth = sleeve_breakdown(holdings_df)
+# sleeve_pool = TARGET SLEEVES ONLY (the deviation/suggestion/deploy denominator —
+# Fix 1, 2026-07-20). Family (Father) is added back on top for net-worth/growth-
+# layer purposes below (net_worth_growth), never for sleeve %/gap math.
+sleeve_df, sleeve_pool = sleeve_breakdown(holdings_df)
+_family_father_value = (
+    holdings_df.loc[holdings_df["Sleeve"].isin(GROWTH_EXTRA_SLEEVES), "Value"].sum()
+    if not holdings_df.empty else 0.0)
+net_worth_growth = sleeve_pool + _family_father_value
 
 cf = latest_cashflow()
 investable = cf.get("investable", 0.0)
@@ -521,12 +613,12 @@ fi_inp = FIInputs(
 base_result = project(fi_inp)  # 10% baseline-ish (uses stored return default)
 _tgt_sleeves = dict(db.get_target_allocation())
 # One-household layer split (Codex/user doctrine 2026-07-20): every holding
-# lands in exactly ONE of three buckets — growth (net_worth_growth, computed
-# in sleeve_breakdown above from target sleeves + GROWTH_EXTRA_SLEEVES),
-# transit (dated, awaiting redeployment), or the locked safety floor
-# (Debt/Safety + Family (Parents) NSCs). Explicit membership sets avoid the
-# old "everything not a target sleeve" catch-all, which orphaned/double-counted
-# non-target growth sleeves like Family (Father).
+# lands in exactly ONE of three buckets — growth (net_worth_growth = sleeve_pool
+# [target sleeves] + Family (Father), computed above), transit (dated, awaiting
+# redeployment), or the locked safety floor (Debt/Safety + Family (Parents)
+# NSCs). Explicit membership sets avoid the old "everything not a target
+# sleeve" catch-all, which orphaned/double-counted non-target growth sleeves
+# like Family (Father).
 _growth_sleeves = set(_tgt_sleeves) | GROWTH_EXTRA_SLEEVES
 transit_value = (holdings_df.loc[holdings_df["Sleeve"] == "Transit (redeploying)", "Value"].sum()
                  if not holdings_df.empty else 0.0)
@@ -546,6 +638,10 @@ _pf_conflict = _epf_from_holdings > 0 and _pf_setting > 0
 total_net_worth = (net_worth_growth + safety_value + transit_value
                    + (0.0 if _pf_conflict else _pf_setting)
                    + s_float("nps_current", 0))
+
+# Concentration guard (Fix 2): computed once here, rendered on "Start Here"
+# and "Goals & Rebalance" only (not a global header banner like _pf_conflict).
+_concentration_hit = concentration_check(holdings_df, net_worth_growth)
 
 st.markdown(
     f"""<div class="vault-hero"><span class="wm"><b>MAVI</b> VAULT</span>
@@ -587,10 +683,11 @@ k4.metric("Est. FI Date", fi_date,
 
 st.divider()
 
-tab_start, tab1, tab_deploy, tab2, tab3, tab4, tab5 = st.tabs([
+tab_start, tab1, tab_deploy, tab_scanner, tab2, tab3, tab4, tab5 = st.tabs([
     "🚀 Start Here",
     "📊 Net Worth & Allocation",
     "💸 Deploy This Month",
+    "🔎 Scanner",
     "💵 Cash Flow & Savings",
     "🔥 FI Projection",
     "📁 Holdings",
@@ -603,6 +700,9 @@ tab_start, tab1, tab_deploy, tab2, tab3, tab4, tab5 = st.tabs([
 # Returning users (who already have holdings) land on the final summary step.
 # ===========================================================================
 with tab_start:
+    if _concentration_hit:
+        st.warning(concentration_warning_text(_concentration_hit))
+
     # First-time users start at step 1; returning users see the summary (step 4).
     st.session_state.setdefault("wiz", 4 if not holdings_df.empty else 1)
     step = st.session_state["wiz"]
@@ -632,7 +732,7 @@ with tab_start:
     elif step == 2:
         amt = st.session_state.get("wiz_amt", 100000)
         st.markdown(f"### 🧮 Here's where your {fmt_full_inr(amt)} goes this month")
-        plan = deploy_plan(amt, sleeve_df, net_worth_growth, "rebalance")
+        plan = deploy_plan(amt, sleeve_df, sleeve_pool, "rebalance")
         tgt_map = dict(db.get_target_allocation())
         st.dataframe(pd.DataFrame([{
             "Sleeve": s,
@@ -732,6 +832,7 @@ with tab_deploy:
     _manifest = db.get_app_state("sentinel_manifest")
     _em_floor = float(_manifest.get("emergency_floor") or EMERGENCY_FLOOR_DEFAULT)
     _em_goal = float(_manifest.get("emergency_goal") or EMERGENCY_GOAL_DEFAULT)
+    _em_vehicles = _manifest.get("emergency_vehicles") or EMERGENCY_VEHICLES_DEFAULT
 
     dc1, dc2, dc3 = st.columns([1, 1, 1.3])
     with dc1:
@@ -756,7 +857,7 @@ with tab_deploy:
     mode = "rebalance" if mode_label.startswith("Smart") else "simple"
 
     em_amount, sleeve_plan = emergency_first_plan(
-        amt, em_bal, sleeve_df, net_worth_growth, _em_floor, mode)
+        amt, em_bal, sleeve_df, sleeve_pool, _em_floor, mode)
     tgt_map = dict(db.get_target_allocation())
 
     # Each entry: (label, why, rupee amount, color-tag). color-tag drives the
@@ -766,7 +867,7 @@ with tab_deploy:
         _plan.append((
             "🚨 Emergency fund — liquid MF / sweep-FD",
             (f"you hold {fmt_inr(em_bal)} of the {fmt_inr(_em_floor)} floor "
-             f"(Vault goal {fmt_inr(_em_goal)}) — safety before markets"),
+             f"(Vault goal {fmt_inr(_em_goal)}) — safety before markets. {_em_vehicles}"),
             em_amount, GOLD))
     for s, a in sleeve_plan:
         if a < 500:
@@ -829,20 +930,32 @@ with tab_deploy:
                 f"tops up your liquid buffer before anything else — "
                 f"{fmt_inr(max(0.0, _em_floor - em_bal - em_amount))} still short of the "
                 f"{fmt_inr(_em_floor)} floor.")
-    elif mode == "rebalance" and net_worth_growth > 0:
+    elif mode == "rebalance" and sleeve_pool > 0:
         st.info("ℹ️ **Smart mode** is funneling more into your under-weight "
                 "sleeves first, so your portfolio drifts back toward target "
                 "without you selling anything.")
-    elif net_worth_growth <= 0:
+    elif sleeve_pool <= 0:
         st.info("ℹ️ No holdings yet, so this is a clean target-weight split. "
                 "Once you own things, **Smart mode** will tilt new money toward "
                 "whatever is lagging.")
+    st.caption("🔎 Full scanner shortlist (CORE top-15 + smallcap satellite) is in "
+               "its own **Scanner** tab.")
 
-    st.divider()
+
+# ===========================================================================
+# TAB — SCANNER (Fix 7, 2026-07-20: promoted out of Deploy This Month into its
+# own tab. The Deploy tab's waterfall keeps its own scanner-pick lines — this
+# tab is the full-detail shortlist: timestamp, spec, CORE top-15, smallcap
+# with its experiment banner, and the two-stage disclaimer.)
+# ===========================================================================
+with tab_scanner:
     st.markdown("##### 🔎 Stock scanner — Codex-081 quantitative screen")
     st.caption("Nifty 500 quality/growth screen + Smallcap-250 satellite experiment · "
                "**advisory only, two-stage**: this screen shortlists → ask Claude for "
                "the judgment pass (news · governance · thesis) before any buy.")
+    _scanner = db.get_app_state("scanner")
+    _core = _scanner.get("core") or []
+    _small = _scanner.get("smallcap") or []
     if not _core and not _small:
         st.info("No scan on file yet — the Sentinel dashboard pushes this at each "
                 "regeneration (`dt_system/dashboard_update.py`).")
@@ -888,7 +1001,11 @@ with tab_deploy:
 with tab1:
     c1, c2, c3 = st.columns(3)
     c1.metric("Total Net Worth", fmt_inr(total_net_worth))
-    c2.metric("Growth Sleeve", fmt_inr(net_worth_growth))
+    c2.metric("Growth Sleeve", fmt_inr(net_worth_growth),
+              help=f"Target sleeves ({fmt_inr(sleeve_pool)}) + Family (Father)'s "
+                   f"HDFC Mid-Cap fund ({fmt_inr(_family_father_value)}) — a real market "
+                   "asset with no allocation target of its own. The allocation charts "
+                   "below (donut/bar/deviation) use the target-sleeve pool only.")
     c3.metric("🛡 Safety Floor", fmt_inr(safety_value),
               help="EPF (both of you) + post office + all 7 NSCs (incl. parents') — "
                    "guaranteed but LOCKED: pledge-able, not spendable, NOT an emergency "
@@ -927,6 +1044,35 @@ with tab1:
     st.caption(f"🛡 Locked-in base (EPF, post office, all NSCs): {fmt_inr(safety_value)}  ·  "
                f"⏳ Transit, redeploying Jul–Aug 26 (chits, small FDs): {fmt_inr(transit_value)}  ·  "
                f"Household total: {fmt_inr(total_net_worth)}")
+
+    # Layer breakup (Fix 6, 2026-07-20): click into each of the three layers to
+    # see exactly which holdings sit inside it — same one-household mapping
+    # (_growth_sleeves / SAFETY_LAYER_SLEEVES / "Transit (redeploying)") used
+    # to compute net_worth_growth / safety_value / transit_value above.
+    def _layer_holdings_table(sleeve_mask):
+        ldf = holdings_df.loc[sleeve_mask, ["Asset", "Sleeve", "Value"]].sort_values(
+            "Value", ascending=False)
+        view = ldf.copy()
+        view["Value"] = view["Value"].map(fmt_inr)
+        view.columns = ["Name", "Sleeve", "Value"]
+        st.dataframe(view, use_container_width=True, hide_index=True)
+
+    with st.expander(f"🚀 Growth engine ({fmt_inr(net_worth_growth)})"):
+        if holdings_df.empty or not holdings_df["Sleeve"].isin(_growth_sleeves).any():
+            st.caption("No growth-layer holdings yet.")
+        else:
+            _layer_holdings_table(holdings_df["Sleeve"].isin(_growth_sleeves))
+    with st.expander(f"🛡 Locked-in base ({fmt_inr(safety_value)})"):
+        if holdings_df.empty or not holdings_df["Sleeve"].isin(SAFETY_LAYER_SLEEVES).any():
+            st.caption("No locked-in base holdings yet.")
+        else:
+            _layer_holdings_table(holdings_df["Sleeve"].isin(SAFETY_LAYER_SLEEVES))
+    with st.expander(f"⏳ Transit ({fmt_inr(transit_value)})"):
+        if holdings_df.empty or not (holdings_df["Sleeve"] == "Transit (redeploying)").any():
+            st.caption("No transit holdings yet.")
+        else:
+            _layer_holdings_table(holdings_df["Sleeve"] == "Transit (redeploying)")
+
     left, right = st.columns([1, 1])
 
     with left:
@@ -945,7 +1091,11 @@ with tab1:
                 template="plotly_dark", height=340, showlegend=True,
                 margin=dict(t=10, b=10, l=10, r=10),
                 legend=dict(font=dict(size=10)),
-                annotations=[dict(text=fmt_inr(net_worth_growth), x=0.5, y=0.5,
+                # Center label = sum of the visible slices (target-sleeve pool),
+                # NOT net_worth_growth — that would double-count Family (Father),
+                # who isn't a slice here (Fix 1: donut, deviations, and priorities
+                # must all agree with each other).
+                annotations=[dict(text=fmt_inr(sleeve_pool), x=0.5, y=0.5,
                                   font_size=15, showarrow=False)],
             )
             st.plotly_chart(donut, use_container_width=True)
@@ -1094,10 +1244,12 @@ with tab3:
         infl = a3.number_input("Inflation %", 0.0, 15.0, s_float("inflation_pct", 6.0), step=0.5)
 
         b1, b2, b3 = st.columns(3)
+        _corpus_stored = s_float("current_corpus", 0)
         cur_corpus = b1.number_input("Current growth corpus (₹)", 0.0,
-                                     value=s_float("current_corpus", 0) or net_worth_growth,
+                                     value=_corpus_stored or net_worth_growth,
                                      step=50000.0,
                                      help="Defaults to your priced growth sleeve")
+        b1.caption("📌 stored override" if _corpus_stored > 0 else "🟢 live from holdings")
         mc = b2.number_input("Monthly contribution (₹)", 0.0,
                              value=s_float("monthly_contribution", 100000), step=5000.0)
         mc_step = b3.number_input("Contribution step-up %/yr", 0.0, 30.0,
@@ -1117,9 +1269,12 @@ with tab3:
 
         st.markdown("**Debt layer** (projected separately from the growth sleeve)")
         d1, d2, d3 = st.columns(3)
-        pf_cur = d1.number_input("PF current (₹)", 0.0, value=s_float("pf_current", 0), step=50000.0,
+        _pf_stored = s_float("pf_current", 0)
+        pf_cur = d1.number_input("PF current (₹)", 0.0,
+                                 value=_pf_stored or _epf_from_holdings, step=50000.0,
                                  help="Leave 0 if EPF is already a holdings row (Debt / Safety) — "
                                       "it auto-feeds from there; setting both double-counts.")
+        d1.caption("📌 stored override" if _pf_stored > 0 else "🟢 live from holdings")
         pf_mo = d2.number_input("PF monthly (₹)", 0.0, value=s_float("pf_monthly", 37500), step=2500.0)
         nps_cur = d3.number_input("NPS current (₹)", 0.0, value=s_float("nps_current", 0), step=50000.0)
         d4, d5 = st.columns(2)
@@ -1303,17 +1458,22 @@ with tab4:
 # TAB 5 — GOALS & REBALANCE
 # ===========================================================================
 with tab5:
+    if _concentration_hit:
+        st.warning(concentration_warning_text(_concentration_hit))
+
     st.markdown("##### 📋 Suggestions — rule-based, priority-ordered, from live data")
-    if net_worth_growth > 0:
+    if sleeve_pool > 0:
         _mc = market_context()
         _tips = []
         # Underweights first, ranked by rupee gap (biggest hole = Priority 1).
         # The gap maths is itself price-responsive: when a sleeve's market falls,
         # its current % shrinks and its gap (priority + ₹) grows automatically.
+        # Uses sleeve_pool (target sleeves only, Fix 1) — same basis as Current %/
+        # Deviation above, so the rupee amount here always agrees with the gap %.
         _unders, _overs = [], []
         for _, _r in sleeve_df.iterrows():
             _gap = _r["Target %"] - _r["Current %"]
-            _amt = _gap / 100.0 * net_worth_growth
+            _amt = _gap / 100.0 * sleeve_pool
             if _gap >= 5:
                 _unders.append((_amt, _gap, _r))
             elif _gap <= -5:
@@ -1331,7 +1491,7 @@ with tab5:
             _tips.append(f"**{_r['Sleeve']}** overweight ({_r['Current %']:.0f}% vs "
                          f"{_r['Target %']:.0f}%).{_x}{context_badge(_mc, _r['Sleeve'])}")
         if transit_value > 0:
-            _ft = net_worth_growth + transit_value
+            _ft = sleeve_pool + transit_value
             _gaps = []
             for _, _r in sleeve_df.iterrows():
                 _need = max(0.0, _r["Target %"] / 100.0 * _ft - _r["Value"])
@@ -1455,13 +1615,13 @@ with tab5:
     st.divider()
     st.markdown("##### Rebalance signal")
     st.caption("Buy / hold / trim per sleeve vs locked target. Threshold ±3pp.")
-    if net_worth_growth <= 0:
+    if sleeve_pool <= 0:
         st.info("Add priced holdings to generate rebalance signals.")
     else:
         signals = []
         for _, r in sleeve_df.iterrows():
             dev = r["Deviation"]
-            target_val = r["Target %"] / 100.0 * net_worth_growth
+            target_val = r["Target %"] / 100.0 * sleeve_pool
             gap_val = target_val - r["Value"]
             if dev <= -3:
                 action, color = "🟢 BUY", GREEN
