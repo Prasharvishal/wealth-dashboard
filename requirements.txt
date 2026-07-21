@@ -4,3 +4,4 @@ plotly>=5.20
 yfinance>=0.2.40
 requests>=2.31
 libsql-client>=0.3.1          # Turso/libSQL durable cloud storage over HTTP (serverless-safe)
+# rebuild-nudge 2026-07-21: force full container restart (stale module cache after multi-commit day)
