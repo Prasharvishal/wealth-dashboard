@@ -28,6 +28,7 @@ import db
 import prices
 import returns
 import fi_engine
+import scan_engine
 import parse_entry as _parse_entry_mod
 from fi_engine import FIInputs, project, run_scenarios
 from parse_entry import parse_entry
@@ -45,7 +46,7 @@ import xirr as _xirr_mod
 
 def _freshen_modules():
     reloaded = False
-    for _m in (db, prices, _xirr_mod, returns, fi_engine, _parse_entry_mod):
+    for _m in (db, prices, _xirr_mod, returns, fi_engine, _parse_entry_mod, scan_engine):
         try:
             _mt = _os.path.getmtime(_m.__file__)
             _seen = getattr(_m, "__loaded_mtime__", None)
@@ -1606,16 +1607,92 @@ with tab_scanner:
     st.caption("Nifty 500 quality/growth screen + Smallcap-250 satellite experiment · "
                "**advisory only, two-stage**: this screen shortlists → ask Claude for "
                "the judgment pass (news · governance · thesis) before any buy.")
+
+    # --- In-app "Scan the market now" -------------------------------------
+    # Server-side scan in this app's own process (outbound HTTP only via
+    # scan_engine.py — no new credentials/ports/daemons). Writes to the SAME
+    # app_state "scanner" key the Mac's weekly regen pushes to; last-writer-
+    # wins is intended, both carry timestamps so it's always clear which one
+    # is showing. 6h anti-fidget gate: fundamentals move quarterly, the list
+    # shouldn't churn — an override checkbox un-gates it for genuine needs.
+    _scanner_pre = db.get_app_state("scanner")
+    _last_scan_at = db.get_app_state("scanner_last_scan_at").get("ts")
+    _newest_ts = _last_scan_at or _scanner_pre.get("generated") or _scanner_pre.get("_updated")
+    _gate_active = False
+    _gate_reason = ""
+    if _newest_ts:
+        _parsed_ts = None
+        for _fmt in (None, "%d %b %Y · %H:%M IST"):
+            try:
+                _parsed_ts = (datetime.fromisoformat(_newest_ts) if _fmt is None
+                              else datetime.strptime(_newest_ts, _fmt))
+                break
+            except Exception:
+                continue
+        if _parsed_ts is not None:
+            _age_h = (datetime.now() - _parsed_ts).total_seconds() / 3600.0
+            if _age_h < 6:
+                _gate_active = True
+                _gate_reason = (f"Last scan was {_age_h:.1f}h ago — fundamentals move "
+                                 "quarterly, the list shouldn't churn. Gated for 6h.")
+
+    _col_btn, _col_override = st.columns([3, 2])
+    with _col_override:
+        _override = st.checkbox("Override 6h gate (genuine need only)",
+                                 key="scanner_override_gate")
+    _disabled = _gate_active and not _override
+    with _col_btn:
+        _scan_clicked = st.button("🔄 Scan the market now (~5–8 min)",
+                                   disabled=_disabled, key="scan_now_btn")
+        if _disabled:
+            st.caption(_gate_reason)
+
+    if _scan_clicked:
+        _progress_bar = st.progress(0)
+        _status_box = st.status("Starting scan…", expanded=True)
+
+        def _progress_cb(done, total, phase):
+            pct = min(1.0, done / total) if total else 0.0
+            try:
+                _progress_bar.progress(pct)
+                _status_box.update(label=f"{phase} ({done}/{total})")
+            except Exception:
+                pass  # progress widgets are best-effort, never fail the scan
+
+        _result = scan_engine.run_scan(progress_cb=_progress_cb)
+
+        if _result.get("status") == "ok":
+            _status_box.update(label="Scan complete.", state="complete")
+            _to_save = {k: _result[k]
+                        for k in ("generated", "spec", "core", "smallcap", "stats", "source")}
+            db.set_app_state("scanner", _to_save)
+            db.set_app_state("scanner_last_scan_at", {"ts": _result["generated"]})
+            st.rerun()
+        elif _result.get("status") == "rate_limited":
+            _status_box.update(label="Rate-limited — aborted.", state="error")
+            st.warning(
+                f"⚠ Yahoo throttled the scan at {_result.get('scanned_n', '?')} of "
+                f"{_result.get('total_n', '?')} symbols — partial results NOT saved; "
+                "the Mac's weekly scan remains canonical; try again later or ask "
+                "Claude to run it locally."
+            )
+        else:
+            _status_box.update(label="Scan failed.", state="error")
+            st.error(f"Scan error: {_result.get('error', 'unknown error')} — "
+                     "nothing was saved; the existing scan (if any) is unchanged.")
+
     _scanner = db.get_app_state("scanner")
     _core = _scanner.get("core") or []
     _small = _scanner.get("smallcap") or []
     if not _core and not _small:
         st.info("No scan on file yet — the Sentinel dashboard pushes this at each "
-                "regeneration (`dt_system/dashboard_update.py`).")
+                "regeneration (`dt_system/dashboard_update.py`), or use the button above.")
     else:
         _gen = _scanner.get("generated") or _scanner.get("_updated") or "?"
         _spec = _scanner.get("spec")
-        st.caption(f"Scanned **{_gen}**" + (f" · spec: {_spec}" if _spec else ""))
+        _source_label = "in-app scan" if _scanner.get("source") == "app" else "Mac weekly scan"
+        st.caption(f"Scanned **{_gen}** · source: **{_source_label}**"
+                   + (f" · spec: {_spec}" if _spec else ""))
         _stats = _scanner.get("stats") or {}
         if _core:
             st.markdown(f"**CORE** · Nifty 500 · "
