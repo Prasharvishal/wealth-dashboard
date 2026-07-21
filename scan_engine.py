@@ -218,8 +218,12 @@ def _raw(d, *path):
         if not isinstance(cur, dict) or k not in cur:
             return None
         cur = cur[k]
-    if isinstance(cur, dict) and "raw" in cur:
-        return cur["raw"]
+    if isinstance(cur, dict):
+        # Yahoo sometimes sends an EMPTY leaf dict ({}, no "raw") instead of
+        # null — returning it raised on numeric gate comparisons and skipped
+        # the symbol via the exception path (73 cached symbols affected,
+        # found 2026-07-21). Empty leaf = missing data = None, clean skip.
+        return cur.get("raw")
     return cur
 
 
