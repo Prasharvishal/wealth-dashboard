@@ -28,6 +28,7 @@ import db
 import prices
 import returns
 from fi_engine import FIInputs, project, run_scenarios
+from parse_entry import parse_entry
 
 # ---------------------------------------------------------------------------
 # Page config + DB bootstrap
@@ -70,6 +71,115 @@ INSTRUMENT_HINTS = {
     "Gold": "Gold ETF, Sovereign Gold Bond, or digital gold",
     "Tactical / thematic": "Your thematic / sector bets (e.g. PSU, energy, momentum funds)",
 }
+
+# Browser voice quick-entry (beta, Part 3). Pure Web Speech API
+# (webkitSpeechRecognition) — NO server-side STT, NO API key, NO compiled
+# Streamlit component, NO streamlit-webrtc. Runs inside components.v1.html's
+# sandboxed iframe, which Streamlit does NOT let write back into a Python-
+# side widget without a custom bidirectional component (out of scope here —
+# no-build only) — so this is a paste-flow: mic -> transcript textarea ->
+# copy button -> user pastes into the quick-entry text_input above.
+# Feature-detected: browsers without SpeechRecognition show a plain notice.
+_VOICE_BETA_HTML = """
+<div style="font-family: -apple-system, sans-serif;">
+  <div id="qe-voice-unsupported" style="display:none; color:#aaa; font-size:0.9em;">
+    Voice input isn't supported in this browser (Web Speech API missing —
+    try Chrome or Edge). Use the text box above instead.
+  </div>
+  <div id="qe-voice-supported" style="display:none;">
+    <button id="qe-mic-btn" style="padding:8px 16px; border-radius:6px; border:1px solid #666;
+      background:#262730; color:#fafafa; cursor:pointer; font-size:0.95em;">
+      🎙️ Start listening
+    </button>
+    <span id="qe-mic-status" style="margin-left:10px; color:#aaa; font-size:0.85em;"></span>
+    <div style="margin-top:10px;">
+      <textarea id="qe-transcript" rows="2" readonly placeholder="transcript appears here..."
+        style="width:100%; box-sizing:border-box; background:#0e1117; color:#fafafa;
+        border:1px solid #444; border-radius:6px; padding:8px; font-size:0.95em;"></textarea>
+    </div>
+    <button id="qe-copy-btn" style="margin-top:6px; padding:6px 14px; border-radius:6px;
+      border:1px solid #666; background:#262730; color:#fafafa; cursor:pointer; font-size:0.85em;">
+      📋 copy
+    </button>
+    <span id="qe-copy-status" style="margin-left:8px; color:#7fdc7f; font-size:0.85em;"></span>
+  </div>
+</div>
+<script>
+(function() {
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  var unsupported = document.getElementById('qe-voice-unsupported');
+  var supported = document.getElementById('qe-voice-supported');
+  if (!SR) {
+    unsupported.style.display = 'block';
+    return;
+  }
+  supported.style.display = 'block';
+
+  var recog = new SR();
+  recog.continuous = false;
+  recog.interimResults = true;
+  recog.lang = 'en-IN';
+
+  var micBtn = document.getElementById('qe-mic-btn');
+  var status = document.getElementById('qe-mic-status');
+  var transcriptBox = document.getElementById('qe-transcript');
+  var copyBtn = document.getElementById('qe-copy-btn');
+  var copyStatus = document.getElementById('qe-copy-status');
+  var listening = false;
+
+  micBtn.addEventListener('click', function() {
+    if (listening) {
+      recog.stop();
+      return;
+    }
+    transcriptBox.value = '';
+    copyStatus.textContent = '';
+    try {
+      recog.start();
+    } catch (e) {
+      status.textContent = 'error: ' + e.message;
+    }
+  });
+
+  recog.onstart = function() {
+    listening = true;
+    micBtn.textContent = '⏹️ Stop listening';
+    status.textContent = 'listening...';
+  };
+  recog.onend = function() {
+    listening = false;
+    micBtn.textContent = '🎙️ Start listening';
+    status.textContent = transcriptBox.value ? 'done — copy and paste above' : '';
+  };
+  recog.onerror = function(e) {
+    status.textContent = 'error: ' + e.error;
+  };
+  recog.onresult = function(event) {
+    var text = '';
+    for (var i = 0; i < event.results.length; i++) {
+      text += event.results[i][0].transcript;
+    }
+    transcriptBox.value = text;
+  };
+
+  copyBtn.addEventListener('click', function() {
+    transcriptBox.select();
+    transcriptBox.setSelectionRange(0, 999999);
+    try {
+      navigator.clipboard.writeText(transcriptBox.value).then(function() {
+        copyStatus.textContent = 'copied!';
+      }, function() {
+        document.execCommand('copy');
+        copyStatus.textContent = 'copied!';
+      });
+    } catch (e) {
+      document.execCommand('copy');
+      copyStatus.textContent = 'copied!';
+    }
+  });
+})();
+</script>
+"""
 
 # ONE-HOUSEHOLD layer doctrine (user decision 2026-07-20): no separate "family"
 # grouping. Ownership stays visible in each holding's NAME only — these two
@@ -1267,6 +1377,62 @@ with tab_deploy:
                "its own **Scanner** tab.")
 
     st.divider()
+    st.markdown("##### ⚡ Quick entry")
+    with st.form("quick_entry_form", clear_on_submit=False):
+        _qe_text = st.text_input(
+            "⚡ Quick entry — type it naturally (e.g. 'invested 10k in gold')",
+            key="quick_entry_text",
+            placeholder="e.g. bought 5000 gold · sip 15k midcap · sold 2L junior bees · 50000 where should I invest",
+        )
+        _qe_submitted = st.form_submit_button("Parse")
+
+    with st.expander("🎙️ Voice input (beta)"):
+        st.caption("beta — transcribe, then paste into quick entry")
+        st.components.v1.html(_VOICE_BETA_HTML, height=180)
+    if _qe_submitted and _qe_text.strip():
+        _qe_holdings = db.get_holdings()
+        _qe = parse_entry(_qe_text, _qe_holdings, db.SLEEVES)
+        if _qe["intent"] == "RECORD":
+            # Pre-fill the record form below via session_state, set BEFORE
+            # those widgets instantiate on this rerun (quick-entry sits above
+            # the form). Never writes to the DB here — the user's own Confirm
+            # tap on the existing form still goes through db.add_transaction
+            # with full validation (epoch floor, amount>0, SELL units).
+            if _qe["asset_match"] is not None:
+                st.session_state["ri_holding_id"] = _qe["asset_match"]["id"]
+            st.session_state["ri_kind"] = _qe["kind"] or "BUY"
+            if _qe["amount"] is not None:
+                st.session_state["ri_amount"] = float(_qe["amount"])
+            _qe_msg = "Review & tap Confirm below ↓"
+            if _qe["asset_match"] is None and _qe["asset_guess_name"]:
+                _qe_msg += f" — guessed **{_qe['asset_guess_name']}**, pick the right one."
+            if _qe["notes"]:
+                _qe_msg += "  \n" + "  \n".join(f"· {n}" for n in _qe["notes"])
+            st.success(f"✅ {_qe_msg}")
+        elif _qe["intent"] == "DEPLOY_QUERY":
+            _qe_amt = float(_qe["amount"])
+            st.caption(f"📍 here's the plan for {fmt_inr(_qe_amt)} — nothing recorded")
+            _qe_em_amt, _qe_sleeve_plan = emergency_first_plan(
+                _qe_amt, em_bal, sleeve_df, sleeve_pool, _em_floor, mode)
+            _qe_rows = []
+            if _qe_em_amt > 0:
+                _qe_rows.append({"Destination": "🚨 Emergency fund — liquid MF / sweep-FD",
+                                 "Amount": fmt_full_inr(_qe_em_amt)})
+            _qe_tgt_map = dict(db.get_target_allocation())
+            for _s, _a in _qe_sleeve_plan:
+                if _a < 500:
+                    continue
+                _qe_rows.append({"Destination": f"{_s} — target {_qe_tgt_map.get(_s, 0):.0f}%",
+                                 "Amount": fmt_full_inr(_a)})
+            st.dataframe(pd.DataFrame(_qe_rows), use_container_width=True, hide_index=True)
+            if _qe["notes"]:
+                st.caption("  \n".join(f"· {n}" for n in _qe["notes"]))
+        else:
+            st.warning("🤔 couldn't parse — try like 'bought 5000 gold' or 'invested 20k niftybees'")
+            if _qe["notes"]:
+                st.caption("  \n".join(f"· {n}" for n in _qe["notes"]))
+
+    st.divider()
     st.markdown("##### 💹 Record an investment")
     st.caption("This ledger powers your XIRR — record EVERY buy/SIP here. "
                "Holding values still update via the Holdings tab; this records "
@@ -1293,10 +1459,12 @@ with tab_deploy:
             ri1, ri2, ri3 = st.columns(3)
             ri_holding_id = ri1.selectbox(
                 "Holding", list(_holding_labels),
-                format_func=lambda i: _holding_labels.get(i, str(i)))
+                format_func=lambda i: _holding_labels.get(i, str(i)),
+                key="ri_holding_id")
             ri_kind = ri2.selectbox("Kind", ["BUY", "SIP", "SELL", "DIVIDEND",
-                                             "MATURITY"])
-            ri_amount = ri3.number_input("Amount (₹)", min_value=0.0, step=1000.0)
+                                             "MATURITY"], key="ri_kind")
+            ri_amount = ri3.number_input("Amount (₹)", min_value=0.0, step=1000.0,
+                                         key="ri_amount")
             # Date bounds (review fix): floor = the ledger epoch (earliest
             # OPENING_BASELINE; pre-baseline flows aren't graded), ceiling =
             # today (no future-dating). db.add_transaction enforces the same
