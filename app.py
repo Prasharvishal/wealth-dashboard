@@ -27,8 +27,41 @@ import streamlit as st
 import db
 import prices
 import returns
+import fi_engine
+import parse_entry as _parse_entry_mod
 from fi_engine import FIInputs, project, run_scenarios
 from parse_entry import parse_entry
+
+# --- Deploy-freshness guard ------------------------------------------------
+# Streamlit Cloud soft-reloads THIS entry file on git push but keeps imported
+# modules cached in the long-running process. A push that changes db.py or
+# returns.py then crashes with AttributeError (happened twice, 2026-07-21).
+# Reload any module whose file on disk is newer than the version in memory,
+# in dependency order, then rebind from-imports. mtime check per rerun is cheap.
+import os as _os
+import importlib as _importlib
+import xirr as _xirr_mod
+
+
+def _freshen_modules():
+    reloaded = False
+    for _m in (db, prices, _xirr_mod, returns, fi_engine, _parse_entry_mod):
+        try:
+            _mt = _os.path.getmtime(_m.__file__)
+            _seen = getattr(_m, "__loaded_mtime__", None)
+            if _seen is not None and _seen != _mt:
+                _importlib.reload(_m)
+                reloaded = True
+            _m.__loaded_mtime__ = _mt
+        except Exception:
+            pass  # never let the guard itself take the app down
+    return reloaded
+
+
+if _freshen_modules():
+    FIInputs, project, run_scenarios = (
+        fi_engine.FIInputs, fi_engine.project, fi_engine.run_scenarios)
+    parse_entry = _parse_entry_mod.parse_entry
 
 # ---------------------------------------------------------------------------
 # Page config + DB bootstrap
