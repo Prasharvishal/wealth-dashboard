@@ -362,6 +362,34 @@ def update_holding(holding_id, **fields):
 
 
 def delete_holding(holding_id):
+    """Delete one holding — recording an auto-SELL into the ledger FIRST.
+
+    Review fix (2026-07-21): deleting a holding used to orphan its ledger
+    rows — the BUY/BASELINE outflows stayed in `transactions` with no
+    terminal value to close them, booking a permanent phantom loss into
+    household XIRR (review measured -58%/yr on a toy case). So, before the
+    row goes: if this holding has ANY ledger rows, insert a SELL dated today
+    at the holding's last-known value (manual_price -> last_price ->
+    buy_price fallback chain, same precedence prices.py uses for stale
+    rows). A holding with no ledger rows deletes clean — inserting a SELL
+    for it would CREATE a positive-only orphan instead of preventing one.
+    returns.split_orphan_sets remains the defense-in-depth for any set this
+    can't close (e.g. value resolved to 0)."""
+    txns = get_transactions(holding_id=holding_id)
+    if txns:
+        h = query_one("SELECT * FROM holdings WHERE id = ?", (holding_id,))
+        if h:
+            qty = float(h.get("quantity") or 0.0)
+            px = h.get("manual_price") or h.get("last_price") or h.get("buy_price") or 0.0
+            value = qty * float(px or 0.0)
+            if value > 0:
+                add_transaction(
+                    date=datetime.now().strftime("%Y-%m-%d"),
+                    asset_name=h["asset_name"], kind="SELL", amount=value,
+                    holding_id=holding_id, sleeve=h.get("sleeve"),
+                    units=(qty or None),
+                    provenance="auto-SELL on holding delete — recorded to keep XIRR truthful",
+                )
     execute("DELETE FROM holdings WHERE id = ?", (holding_id,))
 
 
@@ -612,12 +640,43 @@ def _ensure_transactions_table():
         price REAL, bench_units REAL, provenance TEXT)""")
 
 
+# Fallback epoch floor when no OPENING_BASELINE rows exist to derive it from:
+# the household's ledger epoch (the coordinator-seeded baseline date).
+EPOCH_FLOOR_FALLBACK = "2026-07-21"
+
+
+def epoch_floor_date():
+    """The household's ledger epoch: the earliest OPENING_BASELINE date, or
+    EPOCH_FLOOR_FALLBACK when none exist (fresh install). Non-baseline
+    transactions may never be dated before this — a backdated BUY would
+    silently defeat the forward-only epoch-split doctrine (review fix)."""
+    try:
+        _ensure_transactions_table()
+        row = query_one("SELECT MIN(date) AS d FROM transactions "
+                        "WHERE kind = 'OPENING_BASELINE'")
+        if row and row.get("d"):
+            return str(row["d"])[:10]
+    except Exception:
+        pass
+    return EPOCH_FLOOR_FALLBACK
+
+
 def add_transaction(date, asset_name, kind, amount, holding_id=None, sleeve=None,
                     units=None, price=None, provenance=None):
     """Insert one ledger row. This is the ONLY writer for `transactions` —
     every buy/SIP/sell/dividend/maturity the household wants XIRR'd must be
-    recorded through here (single-responsibility: holdings values are edited
-    separately in the Holdings tab; this never mutates a holding row).
+    recorded through here. SELL is the one kind whose UI flow ALSO updates
+    the linked holding's quantity (app.py record form) — this function itself
+    still never mutates a holding row.
+
+    Write-time validation (review fixes, 2026-07-21): the ledger is the
+    source of truth for XIRR, so garbage is rejected HERE where the user can
+    see the error, not discovered later as a skipped row or a doctrine leak:
+      * date must be ISO-parseable (malformed dates raise ValueError)
+      * date must not be in the future
+      * date must not precede the epoch floor (earliest OPENING_BASELINE)
+        for any kind EXCEPT OPENING_BASELINE itself — forward-only doctrine
+      * amount must be > 0 (signs are derived from `kind`, never entered)
 
     bench_units (the NIFTYBEES shadow-benchmark leg) is computed from the
     LIVE NIFTYBEES price via prices.py so every transaction row is directly
@@ -628,6 +687,28 @@ def add_transaction(date, asset_name, kind, amount, holding_id=None, sleeve=None
     """
     if kind not in TRANSACTION_KINDS:
         raise ValueError(f"add_transaction: kind must be one of {TRANSACTION_KINDS}, got {kind!r}")
+    try:
+        txn_date = datetime.fromisoformat(str(date)).date()
+    except (ValueError, TypeError):
+        raise ValueError(f"add_transaction: date must be ISO format (YYYY-MM-DD), got {date!r}")
+    today = datetime.now().date()
+    if txn_date > today:
+        raise ValueError(f"add_transaction: date {txn_date} is in the future")
+    if kind != "OPENING_BASELINE":
+        floor = datetime.fromisoformat(epoch_floor_date()).date()
+        if txn_date < floor:
+            raise ValueError(
+                f"add_transaction: date {txn_date} precedes the ledger epoch "
+                f"({floor}) — pre-baseline flows aren't graded (epoch-split "
+                "doctrine); only OPENING_BASELINE rows may carry the epoch date."
+            )
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        raise ValueError(f"add_transaction: amount must be a number, got {amount!r}")
+    if amount <= 0:
+        raise ValueError(f"add_transaction: amount must be > 0, got {amount!r} "
+                         "(direction comes from `kind`, never from a sign)")
     _ensure_transactions_table()
 
     bench_units = None
@@ -648,6 +729,14 @@ def add_transaction(date, asset_name, kind, amount, holding_id=None, sleeve=None
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (str(date), holding_id, asset_name, sleeve, kind, float(amount),
              units, price, bench_units, prov))
+
+
+def update_transaction_bench_units(txn_id, bench_units):
+    """Persist a lazily backfilled bench_units value onto one ledger row
+    (returns._try_backfill_bench_units) so the benchmark fetch happens at
+    most once per row, not once per render."""
+    execute("UPDATE transactions SET bench_units = ? WHERE id = ?",
+            (float(bench_units), txn_id))
 
 
 def _ensure_networth_history_table():

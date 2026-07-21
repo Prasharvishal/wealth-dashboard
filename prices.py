@@ -157,6 +157,34 @@ def fetch_stock_price(ticker, is_global=False):
         return None
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_stock_close_on(ticker, date_str):
+    """Close price on (or the last trading day at/before) `date_str` (ISO),
+    via yfinance history. Used by the transactions ledger's lazy bench_units
+    backfill (returns.py) — a row recorded while the live NIFTYBEES fetch was
+    down gets its benchmark leg reconstructed from that day's actual close.
+    Same failure philosophy as every other fetcher here: None on any error,
+    never raises. Cached per (ticker, date) so a persistently unfetchable
+    date costs at most one upstream call per hour.
+    """
+    if yf is None or not ticker or not date_str:
+        return None
+    try:
+        from datetime import timedelta
+        d = datetime.fromisoformat(str(date_str)).date()
+        # 7-day lookback window so weekends/holidays resolve to the last
+        # trading close at/before the requested date.
+        hist = yf.Ticker(ticker).history(
+            start=(d - timedelta(days=7)).isoformat(),
+            end=(d + timedelta(days=1)).isoformat(),
+        )
+        if hist.empty:
+            return None
+        return float(hist["Close"].dropna().iloc[-1])
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Crypto (CoinGecko)
 #

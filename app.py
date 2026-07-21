@@ -236,11 +236,15 @@ def compute_holdings_table():
                 cagr = None
 
         # Forward-measured XIRR from the transactions ledger (epoch-split
-        # doctrine). "—" renders automatically via returns.fmt_xirr when
-        # there's no ledger history yet or < 30 days of it (returns.py
-        # MIN_DAYS_FOR_XIRR) — never an absurd day-one annualized number.
+        # doctrine). Formatted HERE (not in the tab view) because fmt_xirr
+        # needs the roots_found count to mark multi-root answers "~", and a
+        # DataFrame column can't carry that alongside the rate. Renders
+        # "— (needs time)" for <30 days of ledger history (returns.py
+        # MIN_DAYS_FOR_XIRR) and "— (extreme)" for beyond-bracket rates —
+        # never an absurd day-one annualized number, never a conflated dash.
         _h_txns = _txns_by_holding.get(h["id"], [])
-        holding_xirr_val = returns.compute_xirr_for_transactions(_h_txns, value)
+        _hx_rate, _hx_roots = returns.compute_xirr_for_transactions(_h_txns, value)
+        holding_xirr_disp = returns.fmt_xirr(_hx_rate, _hx_roots)
 
         rows.append({
             "id": h["id"],
@@ -256,7 +260,7 @@ def compute_holdings_table():
             "P/L": pl,
             "P/L %": pl_pct,
             "CAGR %": cagr,
-            "XIRR (fwd)": holding_xirr_val,
+            "XIRR (fwd)": holding_xirr_disp,
             "Stale": stale,
             "Source": source,
             "Age": prices.last_price_age(h),
@@ -288,7 +292,12 @@ def growth_chart_figure(history_rows):
         fig.add_scatter(x=hdf["date"], y=hdf["emergency"], name="Emergency",
                         mode="lines+markers", line=dict(color=BLUE, width=2))
     if "loans" in hdf.columns:
-        fig.add_scatter(x=hdf["date"], y=-hdf["loans"].fillna(0), name="Loans (–)",
+        # No fillna(0) here (review fix): a NULL loans value must GAP the
+        # line like every other series — zero-filling it reads as "loan
+        # fully paid off", which is a lie about a missing data point.
+        fig.add_scatter(x=hdf["date"],
+                        y=-pd.to_numeric(hdf["loans"], errors="coerce"),
+                        name="Loans (–)",
                         mode="lines+markers", line=dict(color=RED, width=2, dash="dot"))
     fig.update_layout(
         template="plotly_dark", height=340,
@@ -1022,18 +1031,37 @@ with tab_start:
         # forward-measured from the transactions ledger (epoch-split doctrine
         # — pre-baseline gains aren't graded). With only baseline rows on file
         # this is degenerate by design (see returns.py MIN_DAYS_FOR_XIRR) and
-        # renders "—" rather than a fake day-one number.
+        # renders "— (needs time)" rather than a fake day-one number.
+        # Review hardening (2026-07-21): orphaned transaction sets (holding
+        # deleted / legacy holding_id-less rows without a closing SELL) are
+        # excluded via split_orphan_sets, malformed dates are skipped, and
+        # each exclusion renders a visible caveat instead of a silent skew.
         _all_txns = db.get_transactions()
-        _bench_price = prices.fetch_stock_price("NIFTYBEES.NS", is_global=False)
-        _hh_xirr = returns.household_xirr(_all_txns, total_net_worth)
-        _hh_bench_xirr = returns.household_benchmark_xirr(_all_txns, _bench_price)
+        _kept_txns, _orphan_sets = returns.split_orphan_sets(_all_txns, db.get_holdings())
+        _bad_dates = returns.count_bad_dates(_all_txns)
+        _bench_price = prices.fetch_stock_price(returns.BENCH_TICKER, is_global=False)
+        _hh_xirr, _hh_roots = returns.household_xirr(_kept_txns, total_net_worth)
+        (_hh_bench_xirr, _hh_bench_roots,
+         _bench_compared, _bench_lacking) = returns.household_benchmark_xirr(
+            _kept_txns, _bench_price)
         gc1, gc2 = st.columns(2)
         gc1.metric("📈 Your money's growth rate (since 21 Jul 2026)",
-                   returns.fmt_xirr(_hh_xirr))
-        gc2.metric("vs just-buying-NIFTYBEES", returns.fmt_xirr(_hh_bench_xirr))
+                   returns.fmt_xirr(_hh_xirr, _hh_roots))
+        gc2.metric("vs just-buying-NIFTYBEES",
+                   returns.fmt_xirr(_hh_bench_xirr, _hh_bench_roots))
         st.caption("Forward-measured from the 21 Jul 2026 baseline (epoch-split "
                    "doctrine: pre-baseline gains aren't graded). Early readings "
                    "swing wildly — trust it after ~3 months.")
+        if _bench_lacking:
+            st.caption(f"⚠ benchmark compares {_bench_compared} of "
+                       f"{_bench_compared + _bench_lacking} flows "
+                       f"({_bench_lacking} lacked price data)")
+        if _orphan_sets:
+            st.caption(f"⚠ {_orphan_sets} orphaned transaction set(s) excluded "
+                       "from XIRR — record their SELLs (Deploy This Month → "
+                       "Record an investment)")
+        if _bad_dates:
+            st.caption(f"⚠ {_bad_dates} transaction(s) skipped (bad dates)")
 
         _hist = db.get_networth_history()
         _gfig = growth_chart_figure(_hist)
@@ -1242,44 +1270,98 @@ with tab_deploy:
     st.markdown("##### 💹 Record an investment")
     st.caption("This ledger powers your XIRR — record EVERY buy/SIP here. "
                "Holding values still update via the Holdings tab; this records "
-               "the cash flow.")
-    with st.form("record_investment"):
-        _existing_holdings = db.get_holdings()
-        _holding_options = [0] + [h["id"] for h in _existing_holdings]
-        _holding_labels = {0: "— new asset (type name below) —"}
-        _holding_labels.update({h["id"]: f"{h['asset_name']} ({h['sleeve']})"
-                                for h in _existing_holdings})
-        ri1, ri2 = st.columns(2)
-        ri_holding_id = ri1.selectbox(
-            "Holding", _holding_options,
-            format_func=lambda i: _holding_labels.get(i, str(i)))
-        ri_new_name = ri2.text_input(
-            "New asset name (only if 'new asset' selected above)")
-        ri3, ri4, ri5 = st.columns(3)
-        ri_kind = ri3.selectbox("Kind", ["BUY", "SIP", "SELL", "DIVIDEND", "MATURITY"])
-        ri_amount = ri4.number_input("Amount (₹)", min_value=0.0, step=1000.0)
-        ri_date = ri5.date_input("Date", value=datetime.now().date())
-        ri6, ri7 = st.columns(2)
-        ri_units = ri6.number_input("Units (optional)", min_value=0.0, step=1.0,
-                                    format="%.4f")
-        ri_price = ri7.number_input("Price (optional, ₹)", min_value=0.0, step=1.0)
-        if st.form_submit_button("➕ Record investment", type="primary"):
-            _sel_holding = next((h for h in _existing_holdings if h["id"] == ri_holding_id), None)
-            _asset_name = _sel_holding["asset_name"] if _sel_holding else ri_new_name.strip()
-            _sleeve = _sel_holding["sleeve"] if _sel_holding else None
-            if not _asset_name:
-                st.error("Need a holding selected, or a new asset name typed in.")
-            elif ri_amount <= 0:
-                st.error("Amount must be greater than 0.")
-            else:
-                db.add_transaction(
-                    date=str(ri_date), asset_name=_asset_name, kind=ri_kind,
-                    amount=ri_amount, holding_id=(ri_holding_id or None),
-                    sleeve=_sleeve, units=(ri_units or None), price=(ri_price or None),
-                    provenance="user-entered",
-                )
-                st.success(f"Recorded {ri_kind} {fmt_inr(ri_amount)} for {_asset_name}.")
-                st.rerun()
+               "the cash flow. **SELL is the one kind that also updates the "
+               "holding** (it reduces the quantity — a full exit keeps the row "
+               "at 0). New asset? Create the holding in the **📁 Holdings** tab "
+               "first, then record the buy here.")
+    # Flash from the previous submit — st.rerun() wipes in-form st.success, so
+    # the confirmation (incl. the SELL's resulting new quantity) lands here.
+    _ri_flash = st.session_state.pop("ri_flash", None)
+    if _ri_flash:
+        st.success(_ri_flash)
+    _existing_holdings = db.get_holdings()
+    if not _existing_holdings:
+        # Free-text "new asset" path REMOVED (review fix): a transaction with
+        # no holding row can never receive a terminal value, permanently
+        # dragging household XIRR. The holding must exist first.
+        st.info("No holdings yet — create the holding in the **📁 Holdings** "
+                "tab first, then record its cash flows here.")
+    else:
+        with st.form("record_investment"):
+            _holding_labels = {h["id"]: f"{h['asset_name']} ({h['sleeve']})"
+                               for h in _existing_holdings}
+            ri1, ri2, ri3 = st.columns(3)
+            ri_holding_id = ri1.selectbox(
+                "Holding", list(_holding_labels),
+                format_func=lambda i: _holding_labels.get(i, str(i)))
+            ri_kind = ri2.selectbox("Kind", ["BUY", "SIP", "SELL", "DIVIDEND",
+                                             "MATURITY"])
+            ri_amount = ri3.number_input("Amount (₹)", min_value=0.0, step=1000.0)
+            # Date bounds (review fix): floor = the ledger epoch (earliest
+            # OPENING_BASELINE; pre-baseline flows aren't graded), ceiling =
+            # today (no future-dating). db.add_transaction enforces the same
+            # two rules at write time — this is the friendly first layer.
+            _epoch_min = datetime.fromisoformat(db.epoch_floor_date()).date()
+            ri4, ri5, ri6 = st.columns(3)
+            ri_date = ri4.date_input("Date", value=datetime.now().date(),
+                                     min_value=_epoch_min,
+                                     max_value=datetime.now().date())
+            ri_units = ri5.number_input("Units (SELL needs units or price)",
+                                        min_value=0.0, step=1.0, format="%.4f")
+            ri_price = ri6.number_input("Price (optional, ₹)", min_value=0.0,
+                                        step=1.0)
+            if st.form_submit_button("➕ Record investment", type="primary"):
+                _sel_holding = next((h for h in _existing_holdings
+                                     if h["id"] == ri_holding_id), None)
+                if _sel_holding is None:
+                    st.error("Pick a holding.")
+                elif ri_amount <= 0:
+                    st.error("Amount must be greater than 0.")
+                elif ri_kind == "SELL" and ri_units <= 0 and ri_price <= 0:
+                    # SELL must be able to reduce the holding's quantity —
+                    # without units (or a price to derive them), the stale
+                    # quantity would keep feeding terminal value and the sale
+                    # proceeds would be double-counted (review fix).
+                    st.error("A SELL needs **units sold** — or a **price** so "
+                             "units can be computed as amount ÷ price. SELL "
+                             "also reduces the holding's quantity.")
+                else:
+                    _sell_units = None
+                    if ri_kind == "SELL":
+                        _sell_units = (ri_units if ri_units > 0
+                                       else ri_amount / ri_price)
+                    try:
+                        db.add_transaction(
+                            date=str(ri_date),
+                            asset_name=_sel_holding["asset_name"], kind=ri_kind,
+                            amount=ri_amount, holding_id=ri_holding_id,
+                            sleeve=_sel_holding["sleeve"],
+                            units=(_sell_units if ri_kind == "SELL"
+                                   else (ri_units or None)),
+                            price=(ri_price or None),
+                            provenance="user-entered",
+                        )
+                    except ValueError as _ri_err:
+                        st.error(str(_ri_err))
+                    else:
+                        _msg = (f"Recorded {ri_kind} {fmt_inr(ri_amount)} for "
+                                f"{_sel_holding['asset_name']}.")
+                        if ri_kind == "SELL":
+                            # Ledger row is safely written — now reflect the
+                            # exit in the holding so its market value stops
+                            # double-counting the sold units. Clamp at 0 and
+                            # KEEP the row (qty 0) on a full exit.
+                            _new_qty = max(0.0, float(_sel_holding["quantity"] or 0.0)
+                                           - _sell_units)
+                            db.update_holding(int(ri_holding_id), quantity=_new_qty)
+                            _msg = (f"Recorded SELL {fmt_inr(ri_amount)} — "
+                                    f"{_sel_holding['asset_name']} quantity "
+                                    f"{float(_sel_holding['quantity'] or 0.0):.4f} "
+                                    f"→ {_new_qty:.4f}"
+                                    + (" (fully exited — row kept at 0)"
+                                       if _new_qty == 0 else ""))
+                        st.session_state["ri_flash"] = _msg
+                        st.rerun()
 
 
 # ===========================================================================
@@ -2071,7 +2153,6 @@ with tab4:
             view["P/L %"] = view["P/L %"].map(lambda v: f"{v:+.1f}%")
             view["CAGR %"] = view["CAGR %"].map(
                 lambda v: f"{v:+.1f}%" if pd.notna(v) else "—")
-            view["XIRR (fwd)"] = view["XIRR (fwd)"].map(returns.fmt_xirr)
             view["Stale"] = view["Stale"].map(lambda v: "⚠" if v else "")
             view["Suggestion"] = _chip
             cols = ["Asset", "Qty", "Buy", "Price", "Value", "Cost",
@@ -2091,7 +2172,11 @@ with tab4:
             format_func=lambda i: "—" if i == 0 else
             f"{holdings_df.loc[holdings_df['id']==i,'Asset'].values[0]}",
         )
-        if del_id and st.button("Delete selected holding"):
+        st.caption("🧾 Deleting a holding with ledger history also records an "
+                   "**auto-SELL at its last-known value** in the transactions "
+                   "ledger — the money exits on the books instead of vanishing, "
+                   "keeping household XIRR truthful.")
+        if del_id and st.button("Delete selected holding (records auto-SELL)"):
             db.delete_holding(int(del_id))
             st.rerun()
 
