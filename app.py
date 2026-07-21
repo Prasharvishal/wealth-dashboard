@@ -1142,30 +1142,43 @@ with tab_start:
         # — pre-baseline gains aren't graded). With only baseline rows on file
         # this is degenerate by design (see returns.py MIN_DAYS_FOR_XIRR) and
         # renders "— (needs time)" rather than a fake day-one number.
-        # Review hardening (2026-07-21): orphaned transaction sets (holding
-        # deleted / legacy holding_id-less rows without a closing SELL) are
-        # excluded via split_orphan_sets, malformed dates are skipped, and
-        # each exclusion renders a visible caveat instead of a silent skew.
+        # Review hardening (2026-07-21, Codex 083/092/096): orphaned
+        # transaction sets (holding deleted / legacy holding_id-less rows
+        # without a genuine full-exit close) are excluded via
+        # split_orphan_sets, malformed dates are skipped, and each exclusion
+        # renders a visible caveat instead of a silent skew.
+        #
+        # Codex 096 P1/P5 fix: the "vs NIFTYBEES" panel is TRUE LOCKSTEP —
+        # both sides come from household_benchmark_panel's single shared
+        # comparison_txns set (date-parses AND has/backfills bench_units),
+        # never all-flow actual XIRR against a partial-flow benchmark. The
+        # all-flow household XIRR stays its OWN standalone metric below —
+        # never the direct benchmark counterpart when coverage is partial.
         _all_txns = db.get_transactions()
         _kept_txns, _orphan_sets = returns.split_orphan_sets(_all_txns, db.get_holdings())
         _bad_dates = returns.count_bad_dates(_all_txns)
         _bench_price = prices.fetch_stock_price(returns.BENCH_TICKER, is_global=False)
         _hh_xirr, _hh_roots = returns.household_xirr(_kept_txns, total_net_worth)
-        (_hh_bench_xirr, _hh_bench_roots,
-         _bench_compared, _bench_lacking) = returns.household_benchmark_xirr(
-            _kept_txns, _bench_price)
+        _panel = returns.household_benchmark_panel(_kept_txns, total_net_worth, _bench_price)
         gc1, gc2 = st.columns(2)
-        gc1.metric("📈 Your money's growth rate (since 21 Jul 2026)",
+        gc1.metric("📈 Your money's growth rate (all flows, since 21 Jul 2026)",
                    returns.fmt_xirr(_hh_xirr, _hh_roots))
-        gc2.metric("vs just-buying-NIFTYBEES",
-                   returns.fmt_xirr(_hh_bench_xirr, _hh_bench_roots))
+        gc2.metric("vs just-buying-NIFTYBEES (compared flows only)",
+                   returns.fmt_xirr(_panel["actual_rate"], _panel["actual_roots"]),
+                   help=returns.fmt_xirr(_panel["bench_rate"], _panel["bench_roots"])
+                        + " for NIFTYBEES over the same compared flows")
         st.caption("Forward-measured from the 21 Jul 2026 baseline (epoch-split "
                    "doctrine: pre-baseline gains aren't graded). Early readings "
-                   "swing wildly — trust it after ~3 months.")
-        if _bench_lacking:
-            st.caption(f"⚠ benchmark compares {_bench_compared} of "
-                       f"{_bench_compared + _bench_lacking} flows "
-                       f"({_bench_lacking} lacked price data)")
+                   "swing wildly — trust it after ~3 months. The benchmark panel's "
+                   "terminal value is approximated by scaling total net worth to "
+                   "the compared subset's share of outflow capital — an "
+                   "approximation, not an exact per-holding valuation.")
+        if _panel["lacking"]:
+            st.caption(f"⚠ comparison covers {_panel['compared']} of "
+                       f"{_panel['compared'] + _panel['lacking']} flows "
+                       f"(₹{returns._outflow_basis(_panel['comparison_txns']):,.0f} of "
+                       f"₹{returns._outflow_basis(_kept_txns):,.0f} capital) — "
+                       f"{_panel['lacking']} lacked benchmark price data")
         if _orphan_sets:
             st.caption(f"⚠ {_orphan_sets} orphaned transaction set(s) excluded "
                        "from XIRR — record their SELLs (Deploy This Month → "
@@ -1467,8 +1480,9 @@ with tab_deploy:
                                          key="ri_amount")
             # Date bounds (review fix): floor = the ledger epoch (earliest
             # OPENING_BASELINE; pre-baseline flows aren't graded), ceiling =
-            # today (no future-dating). db.add_transaction enforces the same
-            # two rules at write time — this is the friendly first layer.
+            # today (no future-dating). db.add_transaction/db.record_sell
+            # enforce the same two rules at write time — this is the
+            # friendly first layer.
             _epoch_min = datetime.fromisoformat(db.epoch_floor_date()).date()
             ri4, ri5, ri6 = st.columns(3)
             ri_date = ri4.date_input("Date", value=datetime.now().date(),
@@ -1478,6 +1492,13 @@ with tab_deploy:
                                         min_value=0.0, step=1.0, format="%.4f")
             ri_price = ri6.number_input("Price (optional, ₹)", min_value=0.0,
                                         step=1.0)
+            # Codex 096 P2 fix: over-selling used to be silently clamped to
+            # qty=0. Now db.record_sell() REJECTS units > current quantity
+            # unless this box is ticked — a fat-fingered "100" on a 10-unit
+            # holding errors instead of quietly zeroing the position.
+            ri_full_exit = st.checkbox(
+                "This is a full exit (sell my entire remaining quantity, "
+                "regardless of the units typed above)", key="ri_full_exit")
             if st.form_submit_button("➕ Record investment", type="primary"):
                 _sel_holding = next((h for h in _existing_holdings
                                      if h["id"] == ri_holding_id), None)
@@ -1485,50 +1506,55 @@ with tab_deploy:
                     st.error("Pick a holding.")
                 elif ri_amount <= 0:
                     st.error("Amount must be greater than 0.")
-                elif ri_kind == "SELL" and ri_units <= 0 and ri_price <= 0:
+                elif ri_kind == "SELL" and ri_units <= 0 and ri_price <= 0 and not ri_full_exit:
                     # SELL must be able to reduce the holding's quantity —
-                    # without units (or a price to derive them), the stale
-                    # quantity would keep feeding terminal value and the sale
-                    # proceeds would be double-counted (review fix).
-                    st.error("A SELL needs **units sold** — or a **price** so "
-                             "units can be computed as amount ÷ price. SELL "
-                             "also reduces the holding's quantity.")
+                    # without units (or a price to derive them, or the full-
+                    # exit box), the stale quantity would keep feeding
+                    # terminal value and the sale proceeds would be double-
+                    # counted (review fix).
+                    st.error("A SELL needs **units sold**, a **price** so "
+                             "units can be computed as amount ÷ price, or the "
+                             "**full exit** box ticked. SELL also reduces the "
+                             "holding's quantity.")
+                elif ri_kind == "SELL":
+                    _sell_units = (ri_units if ri_units > 0
+                                   else (ri_amount / ri_price if ri_price > 0 else 0.0))
+                    if ri_full_exit:
+                        _sell_units = float(_sel_holding["quantity"] or 0.0)
+                    try:
+                        _old_qty, _new_qty = db.record_sell(
+                            holding_id=int(ri_holding_id), units=_sell_units,
+                            amount=ri_amount, date=str(ri_date),
+                            price=(ri_price or None), provenance="user-entered",
+                            full_exit=ri_full_exit,
+                        )
+                    except ValueError as _ri_err:
+                        st.error(str(_ri_err))
+                    else:
+                        st.session_state["ri_flash"] = (
+                            f"Recorded SELL {fmt_inr(ri_amount)} — "
+                            f"{_sel_holding['asset_name']} quantity "
+                            f"{_old_qty:.4f} → {_new_qty:.4f}"
+                            + (" (fully exited — row kept at 0)"
+                               if _new_qty == 0 else ""))
+                        st.rerun()
                 else:
-                    _sell_units = None
-                    if ri_kind == "SELL":
-                        _sell_units = (ri_units if ri_units > 0
-                                       else ri_amount / ri_price)
                     try:
                         db.add_transaction(
                             date=str(ri_date),
                             asset_name=_sel_holding["asset_name"], kind=ri_kind,
                             amount=ri_amount, holding_id=ri_holding_id,
                             sleeve=_sel_holding["sleeve"],
-                            units=(_sell_units if ri_kind == "SELL"
-                                   else (ri_units or None)),
+                            units=(ri_units or None),
                             price=(ri_price or None),
                             provenance="user-entered",
                         )
                     except ValueError as _ri_err:
                         st.error(str(_ri_err))
                     else:
-                        _msg = (f"Recorded {ri_kind} {fmt_inr(ri_amount)} for "
-                                f"{_sel_holding['asset_name']}.")
-                        if ri_kind == "SELL":
-                            # Ledger row is safely written — now reflect the
-                            # exit in the holding so its market value stops
-                            # double-counting the sold units. Clamp at 0 and
-                            # KEEP the row (qty 0) on a full exit.
-                            _new_qty = max(0.0, float(_sel_holding["quantity"] or 0.0)
-                                           - _sell_units)
-                            db.update_holding(int(ri_holding_id), quantity=_new_qty)
-                            _msg = (f"Recorded SELL {fmt_inr(ri_amount)} — "
-                                    f"{_sel_holding['asset_name']} quantity "
-                                    f"{float(_sel_holding['quantity'] or 0.0):.4f} "
-                                    f"→ {_new_qty:.4f}"
-                                    + (" (fully exited — row kept at 0)"
-                                       if _new_qty == 0 else ""))
-                        st.session_state["ri_flash"] = _msg
+                        st.session_state["ri_flash"] = (
+                            f"Recorded {ri_kind} {fmt_inr(ri_amount)} for "
+                            f"{_sel_holding['asset_name']}.")
                         st.rerun()
 
 

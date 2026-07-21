@@ -361,36 +361,201 @@ def update_holding(holding_id, **fields):
             list(fields.values()) + [holding_id])
 
 
-def delete_holding(holding_id):
-    """Delete one holding — recording an auto-SELL into the ledger FIRST.
+# ---------------------------------------------------------------------------
+# Atomic multi-statement writes (Codex 096 P1 fixes: record_sell + delete_
+# holding must each be ONE atomic operation, not two separate execute()
+# calls that can be interrupted between them).
+#
+# Backend strategy:
+#   sqlite  — one connection, BEGIN IMMEDIATE ... COMMIT, ROLLBACK on error.
+#   turso   — libsql_client's HTTP ClientSync exposes NO `.transaction()`
+#             (verified against the installed package,
+#             .venv/lib/python3.13/site-packages/libsql_client/http.py:81-87
+#             — HttpClient.transaction() raises LibsqlError
+#             "TRANSACTIONS_NOT_SUPPORTED" unconditionally over HTTP, only a
+#             ws:/wss: URL gets one). It DOES expose `.batch(stmts)`
+#             (sync.py:48-49 -> http.py:73-79 -> v1/batch), and
+#             hrana/convert.py:_batch_to_proto wraps every batch in a real
+#             server-side BEGIN / per-step "ok" conditions / COMMIT / ROLLBACK-
+#             on-any-step-error sequence (convert.py:50-91) — i.e. batch() IS
+#             a genuine atomic transaction over HTTP, so we use it directly
+#             rather than falling back to an idempotency-guard-only path.
+# ---------------------------------------------------------------------------
+def _atomic_batch(statements):
+    """Run `statements` (list of (sql, params) tuples) as ONE atomic unit.
 
-    Review fix (2026-07-21): deleting a holding used to orphan its ledger
-    rows — the BUY/BASELINE outflows stayed in `transactions` with no
-    terminal value to close them, booking a permanent phantom loss into
-    household XIRR (review measured -58%/yr on a toy case). So, before the
-    row goes: if this holding has ANY ledger rows, insert a SELL dated today
-    at the holding's last-known value (manual_price -> last_price ->
-    buy_price fallback chain, same precedence prices.py uses for stale
-    rows). A holding with no ledger rows deletes clean — inserting a SELL
-    for it would CREATE a positive-only orphan instead of preventing one.
+    sqlite: single connection, explicit BEGIN IMMEDIATE / COMMIT / ROLLBACK.
+    turso:  client.batch() — see the strategy note above; the HTTP batch
+            protocol is itself the atomic transaction, no extra BEGIN needed
+            (hrana/convert.py:_batch_to_proto already wraps the steps).
+    """
+    with _LOCK:
+        if _resolve_backend() == "turso":
+            _TURSO_CLIENT.batch([(sql, list(params)) for sql, params in statements])
+            return
+        conn = _get_sqlite()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.cursor()
+            for sql, params in statements:
+                cur.execute(sql, params)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def record_sell(holding_id, units, amount, date, price=None, provenance=None,
+                full_exit=False):
+    """Atomically record a user SELL: insert the SELL transaction row AND
+    update the holding's quantity as ONE operation (Codex 096 P2 fix — the
+    old app.py path called add_transaction() then update_holding()
+    separately, so a crash/error between the two could leave sale proceeds
+    in the ledger with a stale, un-reduced holding quantity: real double-
+    counting of both the sale cashflow and the terminal value of the
+    supposedly-sold units).
+
+    Validation:
+      * units must be > 0.
+      * units must be <= the holding's current quantity UNLESS full_exit=True
+        (set when the UI's "full exit" checkbox is ticked) — over-sell is
+        REJECTED (ValueError) rather than silently clamped, so a fat-fingered
+        quantity can't corrupt the ledger. full_exit converts the sell to
+        exactly the holding's current quantity regardless of what was typed,
+        matching the review's "explicitly tick a full exit checkbox" fix.
+
+    Returns (old_qty, new_qty) for the caller's success message.
+    """
+    h = query_one("SELECT * FROM holdings WHERE id = ?", (holding_id,))
+    if not h:
+        raise ValueError(f"record_sell: no holding with id {holding_id}")
+    current_qty = float(h.get("quantity") or 0.0)
+
+    if units is None or float(units) <= 0:
+        raise ValueError(f"record_sell: units must be > 0, got {units!r}")
+    units = float(units)
+
+    if full_exit:
+        units = current_qty
+    elif units > current_qty:
+        raise ValueError(
+            f"record_sell: units {units} exceeds current quantity {current_qty} "
+            f"for holding {holding_id} — tick 'full exit' to sell the entire "
+            "remaining position, or reduce the units entered."
+        )
+
+    new_qty = max(0.0, current_qty - units)
+
+    try:
+        txn_date = datetime.fromisoformat(str(date)).date()
+    except (ValueError, TypeError):
+        raise ValueError(f"record_sell: date must be ISO format (YYYY-MM-DD), got {date!r}")
+    today = datetime.now().date()
+    if txn_date > today:
+        raise ValueError(f"record_sell: date {txn_date} is in the future")
+    floor = datetime.fromisoformat(epoch_floor_date()).date()
+    if txn_date < floor:
+        raise ValueError(
+            f"record_sell: date {txn_date} precedes the ledger epoch ({floor})"
+        )
+    amount = float(amount)
+    if amount <= 0:
+        raise ValueError(f"record_sell: amount must be > 0, got {amount!r}")
+
+    _ensure_transactions_table()
+
+    bench_units = None
+    prov = provenance
+    try:
+        import prices
+        bench_price = prices.fetch_stock_price("NIFTYBEES.NS", is_global=False)
+        if bench_price:
+            bench_units = float(amount) / bench_price
+        else:
+            prov = (prov + "; " if prov else "") + "bench price unavailable"
+    except Exception:
+        prov = (prov + "; " if prov else "") + "bench price unavailable"
+
+    _atomic_batch([
+        ("""INSERT INTO transactions
+            (date, holding_id, asset_name, sleeve, kind, amount, units, price,
+             bench_units, provenance)
+            VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?)""",
+         (str(txn_date), holding_id, h["asset_name"], h.get("sleeve"),
+          float(amount), units, price, bench_units, prov)),
+        ("UPDATE holdings SET quantity = ? WHERE id = ?",
+         (new_qty, holding_id)),
+    ])
+    return current_qty, new_qty
+
+
+def delete_holding(holding_id):
+    """Delete one holding — atomically recording an auto-SELL into the
+    ledger first when the holding has ledger history (Codex 096 P3 fix: the
+    old path ran read-transactions / read-holding / insert-auto-SELL /
+    delete-holding as FOUR separate DB calls; a failure between the
+    auto-SELL insert and the delete left a live holding at unchanged
+    quantity plus a ledger sale — double-counted on the next render — and a
+    retry could insert a SECOND auto-SELL before the delete finally landed).
+
+    Now: the auto-SELL insert + holding delete are ONE atomic unit (same
+    backend strategy as record_sell — see _atomic_batch), AND the auto-SELL
+    insert is idempotency-guarded (INSERT ... WHERE NOT EXISTS on a
+    deterministic provenance-prefix + holding_id + date match) so a retried
+    delete_holding() call — e.g. the first attempt's DELETE failed after the
+    batch partially applied on a non-transactional path, or the UI button
+    was double-tapped — can never create a second auto-SELL row. A holding
+    with no ledger rows deletes clean (no auto-SELL) — inserting one would
+    CREATE a positive-only orphan instead of preventing one.
     returns.split_orphan_sets remains the defense-in-depth for any set this
-    can't close (e.g. value resolved to 0)."""
+    can't close (e.g. value resolved to 0).
+    """
     txns = get_transactions(holding_id=holding_id)
-    if txns:
-        h = query_one("SELECT * FROM holdings WHERE id = ?", (holding_id,))
-        if h:
-            qty = float(h.get("quantity") or 0.0)
-            px = h.get("manual_price") or h.get("last_price") or h.get("buy_price") or 0.0
-            value = qty * float(px or 0.0)
-            if value > 0:
-                add_transaction(
-                    date=datetime.now().strftime("%Y-%m-%d"),
-                    asset_name=h["asset_name"], kind="SELL", amount=value,
-                    holding_id=holding_id, sleeve=h.get("sleeve"),
-                    units=(qty or None),
-                    provenance="auto-SELL on holding delete — recorded to keep XIRR truthful",
-                )
-    execute("DELETE FROM holdings WHERE id = ?", (holding_id,))
+    h = query_one("SELECT * FROM holdings WHERE id = ?", (holding_id,))
+    if not h:
+        return  # already gone — nothing to do (idempotent no-op)
+
+    if not txns:
+        execute("DELETE FROM holdings WHERE id = ?", (holding_id,))
+        return
+
+    qty = float(h.get("quantity") or 0.0)
+    px = h.get("manual_price") or h.get("last_price") or h.get("buy_price") or 0.0
+    value = qty * float(px or 0.0)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    provenance = "auto-SELL on holding delete — recorded to keep XIRR truthful"
+
+    if value > 0:
+        _ensure_transactions_table()
+        # WHERE NOT EXISTS idempotency guard (review's exact prescribed
+        # pattern): a retry of this whole function re-runs this INSERT, but
+        # it becomes a no-op if a matching auto-SELL row (same holding_id +
+        # date + deterministic provenance prefix) already landed from a
+        # prior partial attempt.
+        _atomic_batch([
+            ("""INSERT INTO transactions
+                (date, holding_id, asset_name, sleeve, kind, amount, units,
+                 price, bench_units, provenance)
+                SELECT ?, ?, ?, ?, 'SELL', ?, ?, NULL, NULL, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM transactions
+                    WHERE holding_id = ?
+                      AND kind = 'SELL'
+                      AND provenance LIKE 'auto-SELL on holding delete%'
+                      AND date = ?
+                )""",
+             (today_str, holding_id, h["asset_name"], h.get("sleeve"),
+              value, (qty or None), provenance,
+              holding_id, today_str)),
+            ("DELETE FROM holdings WHERE id = ?", (holding_id,)),
+        ])
+    else:
+        # No positive last-known value to close with — nothing to insert,
+        # just delete (mirrors the pre-fix behaviour for this branch; the
+        # orphan-set guard in returns.py is the backstop for this case).
+        execute("DELETE FROM holdings WHERE id = ?", (holding_id,))
 
 
 def cache_price(holding_id, price):
@@ -663,11 +828,16 @@ def epoch_floor_date():
 
 def add_transaction(date, asset_name, kind, amount, holding_id=None, sleeve=None,
                     units=None, price=None, provenance=None):
-    """Insert one ledger row. This is the ONLY writer for `transactions` —
-    every buy/SIP/sell/dividend/maturity the household wants XIRR'd must be
-    recorded through here. SELL is the one kind whose UI flow ALSO updates
-    the linked holding's quantity (app.py record form) — this function itself
-    still never mutates a holding row.
+    """Insert one ledger row. This is the writer for every BUY/SIP/DIVIDEND/
+    MATURITY/OPENING_BASELINE the household wants XIRR'd, plus the internal
+    auto-SELL leg of delete_holding(). This function itself never mutates a
+    holding row.
+
+    NOTE (Codex 096 P2 fix, 2026-07-21): user-entered SELLs no longer go
+    through add_transaction() + a separate update_holding() call — that
+    two-step could leave the ledger and the holding's quantity inconsistent
+    on a crash between the calls. Use record_sell() instead, which inserts
+    the SELL row AND updates the holding's quantity as one atomic operation.
 
     Write-time validation (review fixes, 2026-07-21): the ledger is the
     source of truth for XIRR, so garbage is rejected HERE where the user can

@@ -13,20 +13,29 @@ household -> negative. SELL/DIVIDEND/MATURITY are money returned -> positive.
 The terminal leg (today's live value) is always positive and always the LAST
 cashflow appended, dated today.
 
-Review hardening (2026-07-21, both passes):
+Review hardening (2026-07-21, three passes — Codex 083/092/096):
   * split_orphan_sets — defense-in-depth against ledger rows whose holding no
     longer exists (or never did, i.e. legacy holding_id=NULL rows): such a set
     has no terminal value to close it, so including it would book a permanent
     phantom loss into household XIRR (review measured -58%/yr on a toy case).
-    A set is kept only if its holding is alive OR it is self-closed by a
-    SELL/MATURITY flow; everything else is excluded and COUNTED so the UI can
-    say so out loud instead of silently skewing the number.
-  * Benchmark lockstep — the NIFTYBEES shadow ledger includes ONLY flows that
-    carry bench_units, and reports how many were excluded so the UI renders
-    "benchmark compares M of N flows" instead of a silently apples-to-oranges
-    comparison. A NULL bench_units row gets ONE lazy backfill attempt (fetch
-    NIFTYBEES' close for that row's date, persist on success) before being
-    excluded. The headline ACTUAL XIRR still uses every row.
+    A set is kept only if its holding is alive OR it is self-closed per
+    _group_is_closed — units-based (outflow units - SELL/MATURITY units ~= 0),
+    or value-coverage-based when units are unknown, or a deterministic
+    auto-SELL-on-delete provenance row (Codex 096 P4: "has ANY SELL" is NOT
+    sufficient — a partial SELL must never masquerade as a full exit).
+    Everything else is excluded and COUNTED so the UI can say so out loud
+    instead of silently skewing the number.
+  * Benchmark lockstep (Codex 096 P1+P5) — household_benchmark_panel runs ONE
+    shared eligibility pass (build_comparison_set): a row is comparison-
+    eligible iff its date parses and it carries (or backfills, one lazy
+    attempt) bench_units. BOTH the actual-side and benchmark-side XIRR of the
+    "vs NIFTYBEES" panel are computed from that EXACT SAME comparison_txns
+    list — never all-flow actual XIRR against a partial-flow benchmark. The
+    all-flow household_xirr remains its own standalone headline metric, never
+    the direct benchmark counterpart when coverage is partial. The 30-day
+    MIN_DAYS_FOR_XIRR gate runs on the comparison set's own date span, not
+    the all-transaction span — and if the comparison set is empty/too young,
+    BOTH sides of the panel render "— (needs time)" together.
   * Malformed dates never crash the page — bad rows are skipped per-row and
     counted (count_bad_dates) for a visible caption.
 """
@@ -71,16 +80,73 @@ def _span_days(transactions):
     return (date.today() - min(ds)).days
 
 
+_AUTO_SELL_PROVENANCE_PREFIX = "auto-SELL on holding delete"
+_CLOSURE_UNIT_TOL = 1e-4          # ~zero remaining units
+_CLOSURE_VALUE_COVERAGE = 0.95    # realized inflows must cover >=95% of outflow basis
+
+
+def _group_is_closed(txns):
+    """Is this orphaned group (holding deleted/never existed) fully wound
+    down, per Codex 096 P2? "Has a SELL" is NOT sufficient — a partial SELL
+    followed by the holding vanishing must NOT be treated as closed, or the
+    unsold remainder's cost basis books a phantom loss (review repro:
+    OPENING_BASELINE -100000, SELL +10000, holding gone -> was wrongly kept).
+
+    Closure tests, in order:
+      (a) units available: sum(outflow units) - sum(SELL/MATURITY units) ~= 0
+      (b) units unavailable: realized inflow amount >= ~95% of outflow amount
+      (c) contains a deterministic auto-SELL-on-delete provenance row (the
+          delete_holding() path always books the full remaining quantity, so
+          its presence alone is a reliable full-exit signal even if per-row
+          units bookkeeping above is ambiguous).
+    Anything else -> not closed -> excluded from XIRR, counted in the caveat.
+    """
+    if any(str(t.get("provenance") or "").startswith(_AUTO_SELL_PROVENANCE_PREFIX)
+           for t in txns):
+        return True
+
+    outflow_units = 0.0
+    close_units = 0.0
+    units_known = True
+    outflow_amt = 0.0
+    close_amt = 0.0
+    for t in txns:
+        kind = t.get("kind")
+        amt = float(t.get("amount") or 0.0)
+        u = t.get("units")
+        if kind in db.TRANSACTION_OUTFLOW_KINDS:
+            outflow_amt += amt
+            if u in (None, ""):
+                units_known = False
+            else:
+                outflow_units += float(u)
+        elif kind in ("SELL", "MATURITY"):
+            close_amt += amt
+            if u in (None, ""):
+                units_known = False
+            else:
+                close_units += float(u)
+
+    if units_known and outflow_units > 0:
+        return abs(outflow_units - close_units) <= _CLOSURE_UNIT_TOL
+
+    if outflow_amt > 0:
+        return close_amt >= _CLOSURE_VALUE_COVERAGE * outflow_amt
+
+    return False
+
+
 def split_orphan_sets(transactions, live_holdings):
     """Partition the ledger into (kept_transactions, excluded_set_count).
 
     Grouping: rows with a holding_id group by that id; legacy rows without one
     (holding_id NULL — the removed free-text path) group by asset_name. A
     group is KEPT if its holding still exists (today's value provides its
-    terminal leg) or if it is self-closed by a SELL/MATURITY flow (the money
-    already round-tripped; holdings contribute nothing more for it).
-    Everything else is an orphan: excluded from XIRR and counted for the UI
-    caveat ("record their SELLs") — never silently folded into the number.
+    terminal leg) or if it is self-closed per _group_is_closed (a genuine
+    full exit — by units, by realized-value coverage, or a deterministic
+    auto-SELL-on-delete row — not merely "contains any SELL"). Everything
+    else is an orphan: excluded from XIRR and counted for the UI caveat
+    ("record their SELLs") — never silently folded into the number.
     """
     live_ids = {h["id"] for h in live_holdings}
     groups = {}
@@ -91,8 +157,8 @@ def split_orphan_sets(transactions, live_holdings):
 
     kept, excluded = [], 0
     for key, txns in groups.items():
-        closed = any(t.get("kind") in ("SELL", "MATURITY") for t in txns)
         alive = key[0] == "id" and key[1] in live_ids
+        closed = (not alive) and _group_is_closed(txns)
         if alive or closed:
             kept.extend(txns)
         else:
@@ -148,34 +214,107 @@ def _try_backfill_bench_units(t):
         return None
 
 
-def compute_benchmark_xirr(transactions, bench_price):
-    """XIRR of the NIFTYBEES shadow benchmark over the same cashflow dates.
+def build_comparison_set(transactions):
+    """The ONE shared eligibility pass for the 'vs NIFTYBEES' panel (Codex 096
+    P1/P5 fix). A row is comparison-eligible iff its date parses AND it has
+    (or can, after one lazy backfill attempt, acquire) a bench_units value.
 
-    Lockstep rule (review fix): ONLY flows carrying bench_units enter the
-    benchmark ledger — a fetch-miss row is excluded (after one lazy backfill
-    attempt) and counted, never silently mixed. Terminal = net accumulated
-    bench_units * live NIFTYBEES price.
+    Returns (comparison_txns, compared, lacking):
+      comparison_txns — the eligible rows, sorted by date (both the actual
+                         and the benchmark side of the panel are built from
+                         EXACTLY this list, so they can never be on different
+                         capital bases).
+      compared/lacking — counts for the "M of N flows" caption.
 
-    Returns (rate, roots_found, compared, lacking):
-      compared — how many ledger flows made it into the benchmark
-      lacking  — how many were excluded for missing bench_units
+    Malformed dates are skipped and counted separately via count_bad_dates —
+    they never enter `lacking` (that count is specifically about missing
+    bench_units on an otherwise-valid row).
     """
-    if not transactions:
-        return None, 0, 0, 0
-
-    flows = []
-    net_units = 0.0
+    comparison_txns = []
     lacking = 0
     for t in transactions:
         d = _txn_date(t)
         if d is None:
-            continue  # counted separately by count_bad_dates
+            continue  # malformed date — counted by count_bad_dates instead
         bu = t.get("bench_units")
         if bu in (None, ""):
             bu = _try_backfill_bench_units(t)
         if bu in (None, ""):
             lacking += 1
             continue
+        comparison_txns.append(t)
+    comparison_txns.sort(key=lambda t: (str(t.get("date")), t.get("id") or 0))
+    return comparison_txns, len(comparison_txns), lacking
+
+
+def _outflow_basis(transactions):
+    """Sum of outflow (money-leaving-household) amounts across `transactions`
+    — the capital basis used to scale a partial-coverage terminal value."""
+    return sum(float(t.get("amount") or 0.0) for t in transactions
+               if t.get("kind") in db.TRANSACTION_OUTFLOW_KINDS)
+
+
+def comparison_actual_xirr(comparison_txns, all_kept_txns, total_net_worth):
+    """Actual-side XIRR for the 'vs NIFTYBEES' panel, computed ONLY from
+    comparison_txns (Codex 096 P1 fix) — never the all-flow household XIRR.
+
+    Terminal value is scaled to the capital comparison_txns represents, using
+    the simplest correct approximation the review accepted: pro-rate
+    total_net_worth by (comparison outflow basis / all-flow outflow basis).
+    This assumes the household's overall return profile is representative of
+    the compared subset's return profile — an approximation, not an exact
+    subset valuation (a true subset terminal value would require per-holding
+    attribution, which the ledger doesn't carry). Documented here AND in the
+    UI caption per the review's requirement.
+
+    Returns (rate, roots_found) — (None, 0) if comparison_txns is empty/too
+    young (MIN_DAYS_FOR_XIRR gated on the COMPARISON span, not all-flow span)
+    or if the outflow-basis ratio can't be computed (all-flow basis is 0).
+    """
+    if not comparison_txns:
+        return None, 0
+    if _span_days(comparison_txns) < MIN_DAYS_FOR_XIRR:
+        return None, 0
+    all_basis = _outflow_basis(all_kept_txns)
+    comp_basis = _outflow_basis(comparison_txns)
+    if all_basis <= 0:
+        return None, 0
+    terminal_comparison = float(total_net_worth) * (comp_basis / all_basis)
+    flows = _portfolio_cashflows(comparison_txns, terminal_comparison)
+    if len(flows) < 2:
+        return None, 0
+    return xirr_mod.xirr_detailed(flows)
+
+
+def compute_benchmark_xirr(comparison_txns, bench_price):
+    """Benchmark-side XIRR of the NIFTYBEES shadow ledger for the 'vs
+    NIFTYBEES' panel.
+
+    Lockstep rule (Codex 096 P1/P5 fix): the caller MUST pass the same
+    comparison_txns used for comparison_actual_xirr — this function no
+    longer does its own eligibility filtering (that's build_comparison_set's
+    job now, run ONCE and shared by both sides of the panel) and no longer
+    re-attempts a backfill (already attempted when the set was built). The
+    30-day gate here runs on the COMPARISON set's own span, not the original
+    all-transaction span (P5) — a young comparison set renders "needs time"
+    even if an old ineligible row would have satisfied the old, wrong gate.
+
+    Returns (rate, roots_found, compared, lacking) for backward-compatible
+    signature; compared/lacking simply describe the input set here (the
+    counting itself now lives in build_comparison_set).
+    """
+    if not comparison_txns:
+        return None, 0, 0, 0
+
+    flows = []
+    net_units = 0.0
+    for t in comparison_txns:
+        d = _txn_date(t)
+        if d is None:
+            continue  # shouldn't happen — build_comparison_set already filtered
+        bu = t.get("bench_units")
+        if bu in (None, ""):
+            continue  # shouldn't happen — build_comparison_set already filtered
         bu = float(bu)
         amt = float(t["amount"] or 0.0)
         outflow = t["kind"] in db.TRANSACTION_OUTFLOW_KINDS
@@ -188,13 +327,13 @@ def compute_benchmark_xirr(transactions, bench_price):
 
     compared = len(flows)
     if not flows or not bench_price:
-        return None, 0, compared, lacking
-    if _span_days(transactions) < MIN_DAYS_FOR_XIRR:
-        return None, 0, compared, lacking
+        return None, 0, compared, 0
+    if _span_days(comparison_txns) < MIN_DAYS_FOR_XIRR:
+        return None, 0, compared, 0
 
     flows.append((date.today(), net_units * float(bench_price)))
     rate, roots = xirr_mod.xirr_detailed(flows)
-    return rate, roots, compared, lacking
+    return rate, roots, compared, 0
 
 
 def holding_xirr(holding_id, terminal_value):
@@ -211,16 +350,51 @@ def sleeve_xirr(all_transactions, sleeve, terminal_value_by_sleeve):
 
 
 def household_xirr(all_transactions, total_terminal_value):
-    """(rate, roots_found) across every KEPT transaction — the headline
-    number. Callers should pass transactions already filtered through
+    """(rate, roots_found) across every KEPT transaction — the headline,
+    ALL-FLOW number. This is its own standalone metric (Codex 096 P1(b)):
+    never place it as the direct 'vs NIFTYBEES' counterpart when benchmark
+    coverage is partial — use household_benchmark_panel for that comparison.
+    Callers should pass transactions already filtered through
     split_orphan_sets so orphaned sets can't book phantom losses."""
     return compute_xirr_for_transactions(all_transactions, total_terminal_value)
 
 
-def household_benchmark_xirr(all_transactions, bench_price):
-    """The 'vs just-buying-NIFTYBEES' headline number:
-    (rate, roots_found, compared, lacking)."""
-    return compute_benchmark_xirr(all_transactions, bench_price)
+def household_benchmark_panel(all_kept_transactions, total_net_worth, bench_price):
+    """The full 'vs NIFTYBEES' comparison panel — true lockstep (Codex 096
+    P1+P5 fix). Runs the ONE shared eligibility pass (build_comparison_set),
+    then computes BOTH sides of the panel from the exact same comparison_txns
+    so they're never on different capital bases.
+
+    Returns a dict:
+      actual_rate, actual_roots   — comparison-actual XIRR (comparison_txns
+                                     only, terminal scaled to that subset's
+                                     capital — see comparison_actual_xirr)
+      bench_rate, bench_roots     — benchmark XIRR, same comparison_txns
+      compared, lacking           — "compares M of N flows" caption counts
+      comparison_txns             — the eligible subset (callers rarely need
+                                     this directly, but it's exposed for
+                                     tests/debugging)
+
+    If comparison_txns is empty or younger than MIN_DAYS_FOR_XIRR, BOTH
+    actual_rate and bench_rate come back None -> fmt_xirr renders
+    "— (needs time)" on both sides of the panel, per the review's spec.
+    """
+    comparison_txns, compared, lacking = build_comparison_set(all_kept_transactions)
+    actual_rate, actual_roots = comparison_actual_xirr(
+        comparison_txns, all_kept_transactions, total_net_worth)
+    bench_rate, bench_roots, _, _ = compute_benchmark_xirr(comparison_txns, bench_price)
+    # Lockstep enforcement: if either side is gated to None (empty/too-young
+    # comparison set), the OTHER side must not render a number either — a
+    # young comparison set must show "needs time" on BOTH sides (P1(e)).
+    if actual_rate is None or bench_rate is None:
+        actual_rate, actual_roots = None, 0
+        bench_rate, bench_roots = None, 0
+    return {
+        "actual_rate": actual_rate, "actual_roots": actual_roots,
+        "bench_rate": bench_rate, "bench_roots": bench_roots,
+        "compared": compared, "lacking": lacking,
+        "comparison_txns": comparison_txns,
+    }
 
 
 def fmt_xirr(rate, roots_found=1):
