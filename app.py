@@ -1176,7 +1176,7 @@ with tab_start:
         _hist = db.get_networth_history()
         _gfig = growth_chart_figure(_hist)
         if _gfig is not None:
-            st.plotly_chart(_gfig, use_container_width=True)
+            st.plotly_chart(_gfig, use_container_width=True, key="growth_chart_start")
         if len(_hist) < 7:
             st.caption("building your history — one point per day from 21 Jul 2026")
 
@@ -1358,7 +1358,7 @@ with tab_deploy:
             margin=dict(t=10, b=10, l=10, r=10),
             xaxis_title="₹ this month", yaxis=dict(autorange="reversed"),
         )
-        st.plotly_chart(pf_fig, use_container_width=True)
+        st.plotly_chart(pf_fig, use_container_width=True, key="fi_projection_chart")
 
     if em_amount > 0:
         st.info(f"ℹ️ **Emergency-first**: half of this deployment ({fmt_inr(em_amount)}) "
@@ -1607,7 +1607,7 @@ with tab1:
     _nw_hist = db.get_networth_history()
     _nw_gfig = growth_chart_figure(_nw_hist)
     if _nw_gfig is not None:
-        st.plotly_chart(_nw_gfig, use_container_width=True)
+        st.plotly_chart(_nw_gfig, use_container_width=True, key="growth_chart_networth")
     if len(_nw_hist) < 7:
         st.caption("building your history — one point per day from 21 Jul 2026")
 
@@ -1749,7 +1749,7 @@ with tab1:
                 annotations=[dict(text=fmt_inr(sleeve_pool), x=0.5, y=0.5,
                                   font_size=15, showarrow=False)],
             )
-            st.plotly_chart(donut, use_container_width=True)
+            st.plotly_chart(donut, use_container_width=True, key="alloc_donut")
         else:
             st.info("No priced holdings yet — add holdings in the Holdings tab.")
 
@@ -1766,7 +1766,7 @@ with tab1:
             legend=dict(orientation="h", y=1.1),
             yaxis_title="%", xaxis_tickangle=-30,
         )
-        st.plotly_chart(bar, use_container_width=True)
+        st.plotly_chart(bar, use_container_width=True, key="alloc_bar")
 
     st.markdown("##### Deviation per sleeve")
     disp = sleeve_df.copy()
@@ -2095,7 +2095,7 @@ with tab2:
             yaxis_title="₹", yaxis2=dict(title="%", overlaying="y", side="right"),
             legend=dict(orientation="h", y=1.15),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="cashflow_chart")
 
         show = hdf[["month", "income", "expenses", "investable", "pf", "nps", "savings_rate"]].copy()
         for col in ["income", "expenses", "investable", "pf", "nps"]:
@@ -2222,7 +2222,7 @@ with tab3:
         xaxis_title="Age", yaxis_title="₹ (today's money)",
         legend=dict(orientation="h", y=1.12),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key="goals_chart")
 
     with st.expander("Year-by-year table (10% scenario)"):
         rows = [{
