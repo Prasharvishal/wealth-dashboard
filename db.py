@@ -582,6 +582,90 @@ def set_app_state(key, value):
     )
 
 
+TRANSACTION_KINDS = ("OPENING_BASELINE", "BUY", "SIP", "SELL", "DIVIDEND", "MATURITY")
+
+# Kinds that represent money LEAVING the household into an investment (negative
+# cashflow for XIRR); the rest (SELL/DIVIDEND/MATURITY) return money (positive).
+TRANSACTION_OUTFLOW_KINDS = ("OPENING_BASELINE", "BUY", "SIP")
+
+
+def get_transactions(holding_id=None):
+    """All transaction rows, optionally filtered to one holding, oldest first.
+
+    Table already exists live (Turso, seeded by the coordinator with 17
+    OPENING_BASELINE rows 2026-07-21) — this mirrors that exact shape so it's
+    a no-op against Turso and only helps a fresh local SQLite install.
+    """
+    _ensure_transactions_table()
+    if holding_id is not None:
+        return query(
+            "SELECT * FROM transactions WHERE holding_id = ? ORDER BY date, id",
+            (holding_id,))
+    return query("SELECT * FROM transactions ORDER BY date, id")
+
+
+def _ensure_transactions_table():
+    execute("""CREATE TABLE IF NOT EXISTS transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT NOT NULL, holding_id INTEGER, asset_name TEXT NOT NULL,
+        sleeve TEXT, kind TEXT NOT NULL, amount REAL NOT NULL, units REAL,
+        price REAL, bench_units REAL, provenance TEXT)""")
+
+
+def add_transaction(date, asset_name, kind, amount, holding_id=None, sleeve=None,
+                    units=None, price=None, provenance=None):
+    """Insert one ledger row. This is the ONLY writer for `transactions` —
+    every buy/SIP/sell/dividend/maturity the household wants XIRR'd must be
+    recorded through here (single-responsibility: holdings values are edited
+    separately in the Holdings tab; this never mutates a holding row).
+
+    bench_units (the NIFTYBEES shadow-benchmark leg) is computed from the
+    LIVE NIFTYBEES price via prices.py so every transaction row is directly
+    comparable to "if this rupee had bought NIFTYBEES instead". A price-fetch
+    miss never blocks the record — the transaction still writes, bench_units
+    is NULL and provenance notes the gap, matching the graceful-degradation
+    philosophy prices.py already uses everywhere else.
+    """
+    if kind not in TRANSACTION_KINDS:
+        raise ValueError(f"add_transaction: kind must be one of {TRANSACTION_KINDS}, got {kind!r}")
+    _ensure_transactions_table()
+
+    bench_units = None
+    prov = provenance
+    try:
+        import prices
+        bench_price = prices.fetch_stock_price("NIFTYBEES.NS", is_global=False)
+        if bench_price:
+            bench_units = float(amount) / bench_price
+        else:
+            prov = (prov + "; " if prov else "") + "bench price unavailable"
+    except Exception:
+        prov = (prov + "; " if prov else "") + "bench price unavailable"
+
+    execute("""INSERT INTO transactions
+        (date, holding_id, asset_name, sleeve, kind, amount, units, price,
+         bench_units, provenance)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (str(date), holding_id, asset_name, sleeve, kind, float(amount),
+             units, price, bench_units, prov))
+
+
+def _ensure_networth_history_table():
+    execute("""CREATE TABLE IF NOT EXISTS networth_history (
+        date TEXT PRIMARY KEY, assets REAL, growth REAL, locked REAL,
+        emergency REAL, transit REAL, loans REAL)""")
+
+
+def get_networth_history():
+    """All networth_history rows, oldest first — one row/day from the
+    Sentinel regen job. [] if the table doesn't exist yet on an older DB."""
+    _ensure_networth_history_table()
+    try:
+        return query("SELECT * FROM networth_history ORDER BY date")
+    except Exception:
+        return []
+
+
 def delete_app_state(key):
     """Remove one app_state row entirely — used to clean up throwaway test keys."""
     try:

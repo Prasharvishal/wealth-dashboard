@@ -26,6 +26,7 @@ import streamlit as st
 
 import db
 import prices
+import returns
 from fi_engine import FIInputs, project, run_scenarios
 
 # ---------------------------------------------------------------------------
@@ -202,9 +203,16 @@ def s_int(key, default=0):
 
 
 def compute_holdings_table():
-    """Price every holding, compute value / cost / P&L / CAGR. Returns DataFrame."""
+    """Price every holding, compute value / cost / P&L / CAGR / XIRR. Returns DataFrame."""
     rows = []
     any_stale = False
+    # Fetched once outside the loop (single API call, not one per holding) —
+    # same pattern as prices.get_usd_inr's shared-fetch approach.
+    _all_txns = db.get_transactions()
+    _txns_by_holding = {}
+    for _t in _all_txns:
+        _txns_by_holding.setdefault(_t.get("holding_id"), []).append(_t)
+
     for h in db.get_holdings():
         price, stale, source = prices.get_price_for_holding(h)
         any_stale = any_stale or stale
@@ -227,6 +235,13 @@ def compute_holdings_table():
             except Exception:
                 cagr = None
 
+        # Forward-measured XIRR from the transactions ledger (epoch-split
+        # doctrine). "—" renders automatically via returns.fmt_xirr when
+        # there's no ledger history yet or < 30 days of it (returns.py
+        # MIN_DAYS_FOR_XIRR) — never an absurd day-one annualized number.
+        _h_txns = _txns_by_holding.get(h["id"], [])
+        holding_xirr_val = returns.compute_xirr_for_transactions(_h_txns, value)
+
         rows.append({
             "id": h["id"],
             "Asset": h["asset_name"],
@@ -241,6 +256,7 @@ def compute_holdings_table():
             "P/L": pl,
             "P/L %": pl_pct,
             "CAGR %": cagr,
+            "XIRR (fwd)": holding_xirr_val,
             "Stale": stale,
             "Source": source,
             "Age": prices.last_price_age(h),
@@ -249,6 +265,38 @@ def compute_holdings_table():
         })
     df = pd.DataFrame(rows)
     return df, any_stale
+
+
+def growth_chart_figure(history_rows):
+    """Line chart of networth_history: assets + growth-layer lines, loans as
+    a declining negative/secondary line, emergency layer once non-zero.
+
+    Uses the app's existing plotly.graph_objects approach (same pattern as
+    the donut/bar charts elsewhere in this file) rather than introducing a
+    second charting library. Returns None if there's no history yet — the
+    caller renders the "building your history" caption in that case.
+    """
+    if not history_rows:
+        return None
+    hdf = pd.DataFrame(history_rows).sort_values("date")
+    fig = go.Figure()
+    fig.add_scatter(x=hdf["date"], y=hdf["assets"], name="Total assets",
+                    mode="lines+markers", line=dict(color=TEAL, width=2))
+    fig.add_scatter(x=hdf["date"], y=hdf["growth"], name="Growth sleeve",
+                    mode="lines+markers", line=dict(color=GOLD, width=2))
+    if "emergency" in hdf.columns and (hdf["emergency"].fillna(0) != 0).any():
+        fig.add_scatter(x=hdf["date"], y=hdf["emergency"], name="Emergency",
+                        mode="lines+markers", line=dict(color=BLUE, width=2))
+    if "loans" in hdf.columns:
+        fig.add_scatter(x=hdf["date"], y=-hdf["loans"].fillna(0), name="Loans (–)",
+                        mode="lines+markers", line=dict(color=RED, width=2, dash="dot"))
+    fig.update_layout(
+        template="plotly_dark", height=340,
+        margin=dict(t=10, b=10, l=10, r=10),
+        legend=dict(orientation="h", y=1.15),
+        yaxis_title="₹",
+    )
+    return fig
 
 
 def market_context():
@@ -969,6 +1017,31 @@ with tab_start:
     # ---- Step 4: you're set up --------------------------------------------
     else:
         st.markdown("### 🎉 You're all set up!")
+
+        # Tier-1 growth visibility: the headline "is my money growing" answer,
+        # forward-measured from the transactions ledger (epoch-split doctrine
+        # — pre-baseline gains aren't graded). With only baseline rows on file
+        # this is degenerate by design (see returns.py MIN_DAYS_FOR_XIRR) and
+        # renders "—" rather than a fake day-one number.
+        _all_txns = db.get_transactions()
+        _bench_price = prices.fetch_stock_price("NIFTYBEES.NS", is_global=False)
+        _hh_xirr = returns.household_xirr(_all_txns, total_net_worth)
+        _hh_bench_xirr = returns.household_benchmark_xirr(_all_txns, _bench_price)
+        gc1, gc2 = st.columns(2)
+        gc1.metric("📈 Your money's growth rate (since 21 Jul 2026)",
+                   returns.fmt_xirr(_hh_xirr))
+        gc2.metric("vs just-buying-NIFTYBEES", returns.fmt_xirr(_hh_bench_xirr))
+        st.caption("Forward-measured from the 21 Jul 2026 baseline (epoch-split "
+                   "doctrine: pre-baseline gains aren't graded). Early readings "
+                   "swing wildly — trust it after ~3 months.")
+
+        _hist = db.get_networth_history()
+        _gfig = growth_chart_figure(_hist)
+        if _gfig is not None:
+            st.plotly_chart(_gfig, use_container_width=True)
+        if len(_hist) < 7:
+            st.caption("building your history — one point per day from 21 Jul 2026")
+
         st.write("Your starting picture:")
         m1, m2, m3 = st.columns(3)
         m1.metric("Net Worth", fmt_inr(total_net_worth))
@@ -1165,6 +1238,49 @@ with tab_deploy:
     st.caption("🔎 Full scanner shortlist (CORE top-15 + smallcap satellite) is in "
                "its own **Scanner** tab.")
 
+    st.divider()
+    st.markdown("##### 💹 Record an investment")
+    st.caption("This ledger powers your XIRR — record EVERY buy/SIP here. "
+               "Holding values still update via the Holdings tab; this records "
+               "the cash flow.")
+    with st.form("record_investment"):
+        _existing_holdings = db.get_holdings()
+        _holding_options = [0] + [h["id"] for h in _existing_holdings]
+        _holding_labels = {0: "— new asset (type name below) —"}
+        _holding_labels.update({h["id"]: f"{h['asset_name']} ({h['sleeve']})"
+                                for h in _existing_holdings})
+        ri1, ri2 = st.columns(2)
+        ri_holding_id = ri1.selectbox(
+            "Holding", _holding_options,
+            format_func=lambda i: _holding_labels.get(i, str(i)))
+        ri_new_name = ri2.text_input(
+            "New asset name (only if 'new asset' selected above)")
+        ri3, ri4, ri5 = st.columns(3)
+        ri_kind = ri3.selectbox("Kind", ["BUY", "SIP", "SELL", "DIVIDEND", "MATURITY"])
+        ri_amount = ri4.number_input("Amount (₹)", min_value=0.0, step=1000.0)
+        ri_date = ri5.date_input("Date", value=datetime.now().date())
+        ri6, ri7 = st.columns(2)
+        ri_units = ri6.number_input("Units (optional)", min_value=0.0, step=1.0,
+                                    format="%.4f")
+        ri_price = ri7.number_input("Price (optional, ₹)", min_value=0.0, step=1.0)
+        if st.form_submit_button("➕ Record investment", type="primary"):
+            _sel_holding = next((h for h in _existing_holdings if h["id"] == ri_holding_id), None)
+            _asset_name = _sel_holding["asset_name"] if _sel_holding else ri_new_name.strip()
+            _sleeve = _sel_holding["sleeve"] if _sel_holding else None
+            if not _asset_name:
+                st.error("Need a holding selected, or a new asset name typed in.")
+            elif ri_amount <= 0:
+                st.error("Amount must be greater than 0.")
+            else:
+                db.add_transaction(
+                    date=str(ri_date), asset_name=_asset_name, kind=ri_kind,
+                    amount=ri_amount, holding_id=(ri_holding_id or None),
+                    sleeve=_sleeve, units=(ri_units or None), price=(ri_price or None),
+                    provenance="user-entered",
+                )
+                st.success(f"Recorded {ri_kind} {fmt_inr(ri_amount)} for {_asset_name}.")
+                st.rerun()
+
 
 # ===========================================================================
 # TAB — SCANNER (Fix 7, 2026-07-20: promoted out of Deploy This Month into its
@@ -1234,6 +1350,16 @@ with tab1:
               help="EPF (both of you) + post office + all 7 NSCs (incl. parents') — "
                    "guaranteed but LOCKED: pledge-able, not spendable, NOT an emergency "
                    "fund. EPF also feeds the FI projection's PF engine automatically.")
+
+    # Tier-1 growth visibility: same chart as Start Here, since Net Worth &
+    # Allocation is where a returning user actually looks for "is it growing".
+    st.markdown("##### 📈 Growth over time")
+    _nw_hist = db.get_networth_history()
+    _nw_gfig = growth_chart_figure(_nw_hist)
+    if _nw_gfig is not None:
+        st.plotly_chart(_nw_gfig, use_container_width=True)
+    if len(_nw_hist) < 7:
+        st.caption("building your history — one point per day from 21 Jul 2026")
 
     # Money timeline — the app taps your shoulder as dated events approach.
     _evs = [e for e in upcoming_events(holdings_df) if -3 <= e["days"] <= 140]
@@ -1945,10 +2071,12 @@ with tab4:
             view["P/L %"] = view["P/L %"].map(lambda v: f"{v:+.1f}%")
             view["CAGR %"] = view["CAGR %"].map(
                 lambda v: f"{v:+.1f}%" if pd.notna(v) else "—")
+            view["XIRR (fwd)"] = view["XIRR (fwd)"].map(returns.fmt_xirr)
             view["Stale"] = view["Stale"].map(lambda v: "⚠" if v else "")
             view["Suggestion"] = _chip
             cols = ["Asset", "Qty", "Buy", "Price", "Value", "Cost",
-                    "P/L", "P/L %", "CAGR %", "Suggestion", "Source", "Stale", "Age"]
+                    "P/L", "P/L %", "CAGR %", "XIRR (fwd)", "Suggestion",
+                    "Source", "Stale", "Age"]
             if view["Maturity"].notna().any():
                 view["Lands"] = view.apply(
                     lambda r: (f"⏳ {(datetime.fromisoformat(str(r['Maturity'])).date() - datetime.now().date()).days}d"
