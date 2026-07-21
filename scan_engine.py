@@ -63,7 +63,7 @@ FUND_CACHE_KEY = "scanner_fund_cache"
 
 CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1y&interval=1d"
 QSUMMARY_URL = ("https://query1.finance.yahoo.com/v10/finance/quoteSummary/{sym}"
-                "?modules=financialData,defaultKeyStatistics,price&crumb={crumb}")
+                "?modules=financialData,defaultKeyStatistics,price,summaryDetail&crumb={crumb}")
 UA = "Mozilla/5.0"
 REQUEST_TIMEOUT = 25
 
@@ -74,7 +74,7 @@ RATE_LIMIT_ABORT_N = 15
 CORE_TOP_N = 15
 SMALL_TOP_N = 10
 
-SPEC = "CODEX-081-QUANT v1.0 (pre-registered 2026-07-20)"
+SPEC = "CODEX-081-QUANT v1.1 (gates/scoring unchanged from v1.0; +valuation/extension/diff context)"
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +269,10 @@ def fetch_fundamentals(sym_ns, crumb_state, state):
         earningsGrowth=_raw(r0, "financialData", "earningsGrowth"),
         debtToEquity=_raw(r0, "financialData", "debtToEquity"),
         profitMargins=_raw(r0, "financialData", "profitMargins"),
+        # v1.1 DISPLAY-ONLY additions (not gates, not score inputs) — tolerate
+        # absence, old cache entries fetched pre-v1.1 won't have summaryDetail.
+        trailingPE=_raw(r0, "summaryDetail", "trailingPE"),
+        priceToBook=_raw(r0, "defaultKeyStatistics", "priceToBook"),
     )
 
 
@@ -427,6 +431,8 @@ def scan_universe(kind, entries, index_ret6m, cache, crumb_state, top_n, state,
             earng = fund.get("earningsGrowth")
             de = fund.get("debtToEquity")
             margins = fund.get("profitMargins")
+            pe = fund.get("trailingPE")
+            pb = fund.get("priceToBook")
 
             if kind == "core":
                 if not passes_core_gates(close, sma200, mcap, roe, revg, de, margins):
@@ -442,6 +448,9 @@ def scan_universe(kind, entries, index_ret6m, cache, crumb_state, top_n, state,
                 continue
             rs6m = ret6m - index_ret6m
             sc = score_row(revg, earng, roe, rs6m, de)
+            # v1.1 DISPLAY-ONLY: extension above 200-DMA. Not a gate, not a
+            # score input — pure context for how stretched the chart looks.
+            ext_pct = round((close / sma200 - 1) * 100, 1) if sma200 else None
             passed.append(dict(
                 sym=sym, name=name, sector=sector,
                 price=round(close, 2),
@@ -452,6 +461,10 @@ def scan_universe(kind, entries, index_ret6m, cache, crumb_state, top_n, state,
                 de=round(de, 1),
                 rs6m_pct=round(rs6m * 100, 1),
                 score=sc,
+                # v1.1 DISPLAY-ONLY context columns (gates/scoring unchanged):
+                pe=(round(pe, 1) if pe is not None else None),
+                pb=(round(pb, 1) if pb is not None else None),
+                ext_pct=ext_pct,
             ))
         except RateLimitAbort:
             raise
@@ -468,11 +481,48 @@ def scan_universe(kind, entries, index_ret6m, cache, crumb_state, top_n, state,
 
 
 # ---------------------------------------------------------------------------
+# "what changed" diff — v1.1, mirrors scripts/stock_scanner.py's diff_lists()
+# ---------------------------------------------------------------------------
+def _symset(rows):
+    return {r["sym"] for r in (rows or [])}
+
+
+def diff_lists(prev_scanner, core_top, small_top):
+    """Diff old vs new core/smallcap symbol lists for the 'what changed' block.
+
+    prev_scanner is the previous app_state["scanner"] dict (or {} / None on
+    first v1.1 run / absent key) — same shape as this module's own output.
+    First run (no prev_generated, i.e. absent old state): empty lists, not
+    "everything is new" — there's nothing meaningful to diff against yet.
+    """
+    prev_scanner = prev_scanner or {}
+    prev_generated = prev_scanner.get("generated")
+    if not prev_generated:
+        return dict(core_new=[], core_dropped=[], small_new=[], small_dropped=[],
+                    prev_generated=None)
+    prev_core = _symset(prev_scanner.get("core"))
+    prev_small = _symset(prev_scanner.get("smallcap"))
+    new_core = _symset(core_top)
+    new_small = _symset(small_top)
+    return dict(
+        core_new=sorted(new_core - prev_core),
+        core_dropped=sorted(prev_core - new_core),
+        small_new=sorted(new_small - prev_small),
+        small_dropped=sorted(prev_small - new_small),
+        prev_generated=prev_generated,
+    )
+
+
+# ---------------------------------------------------------------------------
 # main entry point
 # ---------------------------------------------------------------------------
-def run_scan(progress_cb=None):
+def run_scan(progress_cb=None, prev_scanner=None):
     """Run the full CORE + SMALLCAP scan. Returns a dict in the exact shape of
     the Mac scanner's scanner_output.json plus {source, status}.
+
+    prev_scanner: the caller's current app_state["scanner"] dict, read BEFORE
+    this call, so the "what changed" diff (v1.1) can compare against it.
+    Optional — omit for no diff (empty-lists changes block).
 
     progress_cb(done, total, phase) is called roughly every 10 symbols.
     Never raises on rate-limiting — returns status "rate_limited" with
@@ -514,12 +564,15 @@ def run_scan(progress_cb=None):
         stats["small_skipped_datagaps"] = small_skipped
         save_fund_cache(cache)
 
+        changes = diff_lists(prev_scanner, core_top, small_top)
+
         return dict(
             generated=dt.datetime.now().strftime("%d %b %Y · %H:%M IST"),
             spec=SPEC,
             core=core_top,
             smallcap=small_top,
             stats=stats,
+            changes=changes,
             source="app",
             status="ok",
         )

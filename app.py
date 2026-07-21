@@ -1659,12 +1659,17 @@ with tab_scanner:
             except Exception:
                 pass  # progress widgets are best-effort, never fail the scan
 
-        _result = scan_engine.run_scan(progress_cb=_progress_cb)
+        # v1.1 "what changed": read the previous scanner state BEFORE we
+        # overwrite it, so scan_engine can diff old vs new symbol lists.
+        _prev_scanner_for_diff = db.get_app_state("scanner")
+        _result = scan_engine.run_scan(progress_cb=_progress_cb,
+                                        prev_scanner=_prev_scanner_for_diff)
 
         if _result.get("status") == "ok":
             _status_box.update(label="Scan complete.", state="complete")
             _to_save = {k: _result[k]
-                        for k in ("generated", "spec", "core", "smallcap", "stats", "source")}
+                        for k in ("generated", "spec", "core", "smallcap", "stats",
+                                  "changes", "source")}
             db.set_app_state("scanner", _to_save)
             db.set_app_state("scanner_last_scan_at", {"ts": _result["generated"]})
             st.rerun()
@@ -1681,6 +1686,46 @@ with tab_scanner:
             st.error(f"Scan error: {_result.get('error', 'unknown error')} — "
                      "nothing was saved; the existing scan (if any) is unchanged.")
 
+    # v1.1 display helpers — PE traffic light + extension gauge. DISPLAY
+    # GUIDANCE ONLY: these bands are not gates and never affect what passes
+    # the screen or how it's scored; they just help the judgment pass.
+    def _pe_light(pe):
+        if pe is None:
+            return "—"
+        if pe < 40:
+            return f"🟢 {pe:.1f}"
+        if pe <= 70:
+            return f"🟠 {pe:.1f}"
+        return f"🔴 {pe:.1f}"
+
+    def _ext_gauge(ext):
+        if ext is None:
+            return "—"
+        s = f"{'+' if ext >= 0 else ''}{ext:.1f}%"
+        if ext <= 15:
+            return s
+        if ext <= 35:
+            return f"🟠 {s}"
+        return f"🔴 {s}"
+
+    def _changes_banner(changes, universe_label, new_key, dropped_key):
+        if not changes:
+            return None
+        new_syms = changes.get(new_key) or []
+        dropped_syms = changes.get(dropped_key) or []
+        prev_gen = changes.get("prev_generated")
+        if not prev_gen:
+            return None  # first v1.1 run — nothing to compare against yet
+        if not new_syms and not dropped_syms:
+            return (f"no changes since {prev_gen} — stability is the norm; "
+                    "a change IS the signal")
+        parts = []
+        if new_syms:
+            parts.append(f"➕ NEW: {', '.join(new_syms)}")
+        if dropped_syms:
+            parts.append(f"➖ DROPPED: {', '.join(dropped_syms)}")
+        return f"since last scan ({prev_gen}): " + " · ".join(parts)
+
     _scanner = db.get_app_state("scanner")
     _core = _scanner.get("core") or []
     _small = _scanner.get("smallcap") or []
@@ -1693,6 +1738,19 @@ with tab_scanner:
         _source_label = "in-app scan" if _scanner.get("source") == "app" else "Mac weekly scan"
         st.caption(f"Scanned **{_gen}** · source: **{_source_label}**"
                    + (f" · spec: {_spec}" if _spec else ""))
+        _changes = _scanner.get("changes") or {}
+        _core_banner = _changes_banner(_changes, "CORE", "core_new", "core_dropped")
+        _small_banner = _changes_banner(_changes, "SMALLCAP", "small_new", "small_dropped")
+        if _core_banner or _small_banner:
+            _lines = [l for l in (
+                (f"CORE — {_core_banner}" if _core_banner else None),
+                (f"SMALLCAP — {_small_banner}" if _small_banner else None),
+            ) if l]
+            st.caption("🔀 " + "  ·  ".join(_lines))
+        st.caption("PE traffic light (🟢<40 · 🟠40–70 · 🔴>70) is display guidance only, "
+                   "not a gate — 🔴 expensive: demand exceptional growth; price matters "
+                   "even for great companies. \"vs 200d\" extension (🟠15–35% · 🔴>35%) is "
+                   "also display-only — 🔴 very extended: patient money waits for a pullback.")
         _stats = _scanner.get("stats") or {}
         if _core:
             st.markdown(f"**CORE** · Nifty 500 · "
@@ -1702,7 +1760,9 @@ with tab_scanner:
                 "Sym": r.get("sym"), "Name": r.get("name"), "Sector": r.get("sector"),
                 "Price": fmt_full_inr(r.get("price", 0)), "ROE %": r.get("roe_pct"),
                 "Rev gr %": r.get("rev_g_pct"), "Earn gr %": r.get("earn_g_pct"),
-                "D/E": r.get("de"), "RS 6m %": r.get("rs6m_pct"), "Score": r.get("score"),
+                "D/E": r.get("de"), "RS 6m %": r.get("rs6m_pct"),
+                "PE": _pe_light(r.get("pe")), "PB": (r.get("pb") if r.get("pb") is not None else "—"),
+                "vs 200d": _ext_gauge(r.get("ext_pct")), "Score": r.get("score"),
             } for r in _core[:15]]
             st.dataframe(pd.DataFrame(_core_rows), use_container_width=True, hide_index=True)
         st.markdown(f"🧪 **SMALLCAP SATELLITE** · Smallcap 250 · "
@@ -1714,7 +1774,8 @@ with tab_scanner:
                 "Sym": r.get("sym"), "Name": r.get("name"), "Sector": r.get("sector"),
                 "Price": fmt_full_inr(r.get("price", 0)), "ROE %": r.get("roe_pct"),
                 "Rev gr %": r.get("rev_g_pct"), "RS 6m %": r.get("rs6m_pct"),
-                "Score": r.get("score"),
+                "PE": _pe_light(r.get("pe")), "PB": (r.get("pb") if r.get("pb") is not None else "—"),
+                "vs 200d": _ext_gauge(r.get("ext_pct")), "Score": r.get("score"),
             } for r in _small]
             st.dataframe(pd.DataFrame(_small_rows), use_container_width=True, hide_index=True)
         else:

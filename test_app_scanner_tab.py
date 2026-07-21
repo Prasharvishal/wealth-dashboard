@@ -90,6 +90,74 @@ def test_b_seeded_scan_dict_app_sourced():
     print("PASS: (b2) app-sourced seeded scan -> 0 exceptions")
 
 
+def test_b_seeded_scan_dict_v11_with_changes_and_none_pe():
+    # v1.1 shape: pe/pb/ext_pct present (incl. a None pe — old cache entry not
+    # yet refreshed) + a populated "changes" diff block. Must render 0 exceptions.
+    db.set_app_state("scanner", {
+        "generated": "21 Jul 2026 · 22:20 IST",
+        "spec": "CODEX-081-QUANT v1.1 (gates/scoring unchanged from v1.0; "
+                "+valuation/extension/diff context)",
+        "core": [{
+            "sym": "TCS", "name": "Tata Consultancy Services", "sector": "IT",
+            "price": 3800.5, "mcap_cr": 1400000.0, "roe_pct": 45.0,
+            "rev_g_pct": 12.0, "earn_g_pct": 10.0, "de": 8.0,
+            "rs6m_pct": 5.0, "score": 72.3,
+            "pe": None, "pb": 12.4, "ext_pct": 18.2,  # None pe = stale cache entry
+        }, {
+            "sym": "INFY", "name": "Infosys", "sector": "IT",
+            "price": 1500.0, "mcap_cr": 620000.0, "roe_pct": 30.0,
+            "rev_g_pct": 9.0, "earn_g_pct": 8.0, "de": 5.0,
+            "rs6m_pct": 2.0, "score": 60.1,
+            "pe": 85.0, "pb": 9.1, "ext_pct": 41.0,  # exercises 🔴 bands both cols
+        }],
+        "smallcap": [{
+            "sym": "XYZ", "name": "XYZ Ltd", "sector": "Chemicals",
+            "price": 450.0, "mcap_cr": 5000.0, "roe_pct": 20.0,
+            "rev_g_pct": 18.0, "earn_g_pct": 22.0, "de": 30.0,
+            "rs6m_pct": 8.0, "score": 65.0,
+            "pe": 45.0, "pb": 3.2, "ext_pct": 4.5,  # exercises 🟠 PE band
+        }],
+        "stats": {"core_universe": 500, "core_passed": 2, "core_skipped_datagaps": 3,
+                   "small_universe": 250, "small_passed": 1, "small_skipped_datagaps": 249},
+        "changes": {
+            "core_new": ["INFY"], "core_dropped": ["WIPRO"],
+            "small_new": [], "small_dropped": ["ABC"],
+            "prev_generated": "14 Jul 2026 · 22:20 IST",
+        },
+        "source": "app",
+    })
+    db.delete_app_state("scanner_last_scan_at")
+    at = _new_apptest()
+    at.run()
+    assert not at.exception, f"exceptions on v1.1 seeded scan (incl. changes + None pe): {at.exception}"
+    print("PASS: (b3) v1.1 seeded scan w/ changes block + None pe -> 0 exceptions")
+
+
+def test_b_seeded_scan_dict_legacy_v10_no_new_keys():
+    # Backward compat: a legacy v1.0 dict with NO pe/pb/ext_pct/changes keys
+    # at all must not crash the v1.1 UI code (r.get(...) must degrade to "—").
+    db.set_app_state("scanner", {
+        "generated": "10 Jul 2026 · 09:00 IST",
+        "spec": "CODEX-081-QUANT v1.0 (pre-registered 2026-07-20)",
+        "core": [{
+            "sym": "HDFCBANK", "name": "HDFC Bank", "sector": "Financials",
+            "price": 1650.0, "mcap_cr": 1250000.0, "roe_pct": 17.0,
+            "rev_g_pct": 10.0, "earn_g_pct": 9.0, "de": 90.0,
+            "rs6m_pct": 3.0, "score": 55.0,
+            # NOTE: no pe/pb/ext_pct keys — pre-v1.1 shape
+        }],
+        "smallcap": [],
+        "stats": {"core_universe": 500, "core_passed": 1, "core_skipped_datagaps": 3,
+                   "small_universe": 250, "small_passed": 0, "small_skipped_datagaps": 250},
+        # NOTE: no "changes" key at all — pre-v1.1 shape
+    })
+    db.delete_app_state("scanner_last_scan_at")
+    at = _new_apptest()
+    at.run()
+    assert not at.exception, f"exceptions on legacy v1.0 dict (no new keys): {at.exception}"
+    print("PASS: (b4) legacy v1.0 dict without new keys -> 0 exceptions (backward compat)")
+
+
 def test_c_button_gated_when_recent():
     from datetime import datetime
     db.set_app_state("scanner_last_scan_at", {"ts": datetime.now().isoformat()})
@@ -117,6 +185,8 @@ ALL_TESTS = [
     test_a_no_scan_in_app_state,
     test_b_seeded_scan_dict_mac_sourced,
     test_b_seeded_scan_dict_app_sourced,
+    test_b_seeded_scan_dict_v11_with_changes_and_none_pe,
+    test_b_seeded_scan_dict_legacy_v10_no_new_keys,
     test_c_button_gated_when_recent,
     test_c_button_not_gated_when_stale,
 ]
