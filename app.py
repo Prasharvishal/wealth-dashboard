@@ -12,7 +12,9 @@ Module layout:
   db.py        — SQLite persistence (holdings, cashflow, goals, settings, allocation)
   prices.py    — live price fetchers + graceful stale fallback
   fi_engine.py — deterministic FI projection (3 scenarios, real + nominal)
-  app.py       — this file: auth gate, theme, 5 tabs, charts
+  app.py       — this file: auth gate, theme, 9 tabs (Start Here, Net Worth &
+                 Allocation, Targets, Deploy This Month, Scanner, Cash Flow &
+                 Savings, FI Projection, Holdings, Goals & Rebalance), charts
 """
 
 import re
@@ -52,19 +54,19 @@ SLEEVE_COLORS = {
     "Direct Stocks": "#f0883e",   # orange — was gold, too close to the Gold sleeve
     "Global / US": "#a371f7",
     "Gold": "#e3b341",
-    "Crypto": "#f778ba",
     "Tactical / thematic": "#56d364",
 }
 
 # Plain-English "what do I actually buy for this sleeve" hints, shown in the
 # Deploy tab so a non-expert knows where the money goes.
+# Crypto entry retired 2026-07-21 (targets sitting) — crypto exposure now
+# lives only via the Sentinel probation charter, never the Vault sleeves.
 INSTRUMENT_HINTS = {
     "Nifty 50 (core)": "Nifty 50 index fund / ETF (e.g. UTI or Nippon Nifty 50 Index Fund)",
     "Nifty Next 50": "Nifty Next 50 index fund (e.g. ICICI/UTI Next 50 Index Fund)",
     "Direct Stocks": "Your own researched stocks (the 20% you pick yourself)",
     "Global / US": "S&P 500 / Nasdaq-100 fund (e.g. Motilal Oswal S&P 500 Index Fund)",
     "Gold": "Gold ETF, Sovereign Gold Bond, or digital gold",
-    "Crypto": "BTC / SOL via your exchange (Delta, CoinDCX, etc.)",
     "Tactical / thematic": "Your thematic / sector bets (e.g. PSU, energy, momentum funds)",
 }
 
@@ -322,7 +324,9 @@ def suggestion_chip(sleeve, sleeve_pct, target_pct):
     if sleeve == "Transit (redeploying)":
         return "REDEPLOY", "dated money awaiting its landing-plan destination"
     if sleeve == EMERGENCY_SLEEVE:
-        return "HOLD · liquid", "goal-tracked (₹12L), not a %-target sleeve — keep it reachable"
+        return ("HOLD · liquid",
+                f"goal-tracked ({fmt_inr(_em_goal_amount)}), not a %-target sleeve — "
+                "keep it reachable")
     if target_pct is None:
         return "HOLD", "no target set for this sleeve yet"
     if sleeve_pct < target_pct * 0.8:
@@ -931,9 +935,11 @@ with tab_start:
             wname = w1.text_input("Asset name", placeholder="e.g. Nippon Nifty 50 Index")
             wsleeve = w2.selectbox("Sleeve", db.SLEEVES)
             w3, w4 = st.columns(2)
-            watype = w3.selectbox("Type", ["mf", "stock", "global", "crypto", "manual"],
+            # "crypto" intentionally excluded (Vault doctrine, 2026-07-21): no
+            # crypto tracking here — see the Sentinel probation charter.
+            watype = w3.selectbox("Type", ["mf", "stock", "global", "manual"],
                                   help="mf=AMFI code · stock=.NS ticker · global=US ticker "
-                                       "· crypto=BTC/SOL · manual=type price")
+                                       "· manual=type price")
             wticker = w4.text_input("Ticker / scheme code / coin",
                                     placeholder="122639 / RELIANCE.NS / VOO / BTC")
             w5, w6, w7 = st.columns(3)
@@ -1538,8 +1544,6 @@ TARGETS_CONTEXT_CAPTIONS = {
     "Global / US": "📊 Currently ~58% of the target-sleeve pool (overweight vs its "
         "20% target) — the donut/deviation numbers on Net Worth & Allocation are "
         "the live version of this.",
-    "Crypto": "📊 Crypto carries a 30% flat VDA tax in India with **no loss offset** — "
-        "factor the tax drag into any proposed change here.",
     "Direct Stocks": "📊 Governed by the scanner + one-new-name-per-month rule "
         "(see the Scanner tab and the Monthly review) — raising this target doesn't "
         "relax that discipline.",
@@ -1878,10 +1882,13 @@ with tab4:
                  f"{EMERGENCY_SLEEVE} = liquid buffer (bank/liquid-fund/sweep-FD) — its "
                  "own layer, feeds the Deploy tab's emergency line automatically.",
         )
+        # "crypto" intentionally excluded (Vault doctrine, 2026-07-21): no
+        # crypto tracking here — crypto exposure only via the Sentinel
+        # probation charter (dt_system/RUNBOOK.md §4), never the Vault.
         atype = h3.selectbox(
-            "Type", ["mf", "stock", "global", "crypto", "manual"],
+            "Type", ["mf", "stock", "global", "manual"],
             help="mf=AMFI NAV · stock=yfinance .NS · global=yfinance USD→INR · "
-                 "crypto=CoinGecko · manual=enter price yourself",
+                 "manual=enter price yourself",
         )
         h4, h5, h6 = st.columns(3)
         ticker = h4.text_input("Ticker / scheme code / coin",
@@ -2054,14 +2061,8 @@ with tab5:
                 "Gold": "*GOLDBEES* ETF in the demat, or Sovereign Gold Bonds from the "
                     "secondary market when yield-to-maturity is fair (SGB adds 2.5%/yr "
                     "interest, tax-free at maturity).",
-                "Crypto": "**BTC only, spot only.** One coin: Bitcoin is the index of "
-                    "this asset class; everything else is higher-beta on top of it. INR "
-                    "exchange (CoinDCX spot) or Delta spot — **never futures/leverage "
-                    "for the sleeve**. BTC is currently below its 200-day average (trend "
-                    "not repaired) — split into 2–3 buys over a few weeks; the 5% cap "
-                    "applies regardless of price. Tax truth: 30% flat on gains + 1% TDS, "
-                    "**no loss offset** — enter only what you'd hold for years. Log every "
-                    "buy here in Holdings (type `crypto`, ticker `BTC`).",
+                # Crypto sleeve retired 2026-07-21 (targets sitting) — crypto
+                # exposure only via the Sentinel probation charter, never the Vault.
                 "Tactical / thematic": "Your own theses (PSU, momentum funds, etc.). The "
                     "one rule: a written entry reason + exit condition per position, "
                     "reviewed monthly alongside the stocks.",
@@ -2084,10 +2085,12 @@ with tab5:
         st.divider()
     st.markdown("##### Goal progress")
     goals = db.get_goals()
-    # Emergency fund is funded from cash; milestones tracked against net worth.
+    # Emergency fund progress uses the LIVE holdings-derived balance
+    # (emergency_holdings_value — the same source Start Here/Deploy/Net Worth
+    # all use), never a manually-typed setting. Milestones track net worth.
     for g in goals:
         if g["kind"] == "emergency":
-            current = s_float("emergency_current", 0)
+            current = emergency_holdings_value
         elif g["kind"] == "travel":
             current = s_float("travel_current", 0)   # earmarked only — not net worth
         else:
@@ -2098,11 +2101,9 @@ with tab5:
         st.progress(min(pct / 100.0, 1.0))
 
     with st.expander("Edit goals / emergency fund balance"):
-        ef = st.number_input("Emergency fund current balance (₹)", min_value=0.0,
-                             value=s_float("emergency_current", 0), step=10000.0)
-        if st.button("Save emergency balance"):
-            db.set_setting("emergency_current", ef)
-            st.rerun()
+        st.caption("🚨 Emergency fund progress is now LIVE from the "
+                   f"{EMERGENCY_SLEEVE} sleeve's holdings — add/edit those in the "
+                   "Holdings tab. There's no manual balance to type here anymore.")
         st.divider()
         with st.form("add_goal"):
             gn = st.text_input("Goal name")

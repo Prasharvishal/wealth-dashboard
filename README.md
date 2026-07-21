@@ -9,16 +9,22 @@ shared passcode.
 
 | Tab | Shows |
 |---|---|
+| **Start Here** | 4-step guided walkthrough for the first month (amount → split → record buys → summary) |
 | **Net Worth & Allocation** | Total net worth, current-vs-target donut + bar, per-sleeve deviation |
+| **Targets** | Guided sitting on the locked target allocation — current standing, propose a new split, save only via typed CONFIRM, change history |
+| **Deploy This Month** | The full waterfall: emergency buffer → sleeve gaps → scanner stock + optional smallcap satellite |
+| **Scanner** | Nifty 500 quality/growth screen + Smallcap-250 satellite shortlist (advisory, two-stage) |
 | **Cash Flow & Savings** | Log monthly investable + expenses, savings-rate %, history chart |
 | **FI Projection** | 3 return scenarios (8/10/12%), **real + nominal** corpus, projectable expenses, "FI reached at age X", PF/NPS projected separately |
 | **Holdings** | Auto-priced table (value, cost, P/L %, CAGR), grouped by sleeve |
-| **Goals & Rebalance** | Progress bars (emergency fund, ₹50L/1Cr/5Cr/10Cr, travel) + buy/hold/trim rebalance signal |
+| **Goals & Rebalance** | Progress bars (emergency fund [live from holdings], ₹50L/1Cr/5Cr/10Cr, travel) + buy/hold/trim rebalance signal |
 
 ### Data sources (all free, no keys)
 - **Indian mutual funds** → [AMFI NAVAll.txt](https://www.amfiindia.com/spages/NAVAll.txt), parsed by scheme code.
 - **Stocks / indices / global ETFs** → `yfinance` (Indian tickers need `.NS`/`.BO`; global tickers auto-converted USD→INR).
-- **Crypto** → CoinGecko free `simple/price` API.
+- **Crypto** → CoinGecko free `simple/price` API. Dormant since the 2026-07-21
+  targets sitting retired the Vault's Crypto sleeve — the fetcher stays in
+  `prices.py` (harmless, unreachable from the UI) but no add-form offers it.
 
 All fetches are cached 1 hour (`@st.cache_data(ttl=3600)`). If a fetch fails, the
 last-stored price is shown with a **⚠ stale** flag — the app never crashes.
@@ -46,8 +52,11 @@ Open http://localhost:8501. Default passcode: **`fire2026`** (override on deploy
 | `mf` | AMFI scheme code | `122639` |
 | `stock` | yfinance ticker (.NS/.BO) | `RELIANCE.NS` |
 | `global` | yfinance ticker (USD) | `VOO`, `QQQM` |
-| `crypto` | symbol or CoinGecko id | `BTC`, `SOL`, `ethereum` |
 | `manual` | — (set Manual price) | gold bars, ESOPs, FDs |
+
+`crypto` (CoinGecko) is not offered in the Holdings add-form — the Vault's
+Crypto sleeve was retired at the 2026-07-21 targets sitting. Crypto exposure
+now lives only via the separate Sentinel probation charter, never this app.
 
 ---
 
@@ -138,7 +147,7 @@ connect, exactly like the local file.)
 
 ## File map
 ```
-app.py            # UI: auth gate, theme, 5 tabs, KPI row, charts
+app.py            # UI: auth gate, theme, 9 tabs, KPI row, charts
 db.py             # SQLite layer; seeds locked allocation + defaults on first run
 prices.py         # AMFI / yfinance / CoinGecko fetchers + stale fallback
 fi_engine.py      # deterministic FI projection (real + nominal, 3 scenarios)

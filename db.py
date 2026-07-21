@@ -32,14 +32,16 @@ from datetime import datetime
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wealth.db")
 
 # The locked target allocation (growth sleeve). Seeded on first launch.
+# Re-locked at user targets sitting 2026-07-21 (audit: app_state
+# targets_history); crypto exposure only via the Sentinel probation charter,
+# never the Vault.
 TARGET_ALLOCATION = [
-    ("Nifty 50 (core)", 25.0),
-    ("Nifty Next 50", 10.0),
+    ("Nifty 50 (core)", 30.0),
     ("Direct Stocks", 20.0),
     ("Global / US", 20.0),
-    ("Gold", 5.0),
-    ("Crypto", 5.0),
     ("Tactical / thematic", 15.0),
+    ("Nifty Next 50", 10.0),
+    ("Gold", 5.0),
 ]
 SLEEVES = [s for s, _ in TARGET_ALLOCATION]
 

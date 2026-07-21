@@ -159,6 +159,13 @@ def fetch_stock_price(ticker, is_global=False):
 
 # ---------------------------------------------------------------------------
 # Crypto (CoinGecko)
+#
+# DORMANT since the 2026-07-21 targets sitting: the Vault's Crypto sleeve was
+# retired (db.py's TARGET_ALLOCATION no longer carries it, and the Holdings
+# add-forms in app.py no longer offer asset_type "crypto"), so nothing in the
+# app can create a holding that reaches this function anymore. Left in place
+# harmlessly rather than deleted — crypto exposure now lives only via the
+# Sentinel probation charter (dt_system/RUNBOOK.md §4), never the Vault.
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_crypto_price(coin_key):
@@ -227,6 +234,9 @@ def get_price_for_holding(holding):
         price = fetch_stock_price(holding.get("ticker"), is_global=True)
         source = "yfinance (USD→INR)"
     elif atype == "crypto":
+        # Dormant path (see the Crypto/CoinGecko section note above): no UI
+        # path creates asset_type "crypto" holdings since the 2026-07-21
+        # targets sitting. Kept for any pre-existing row / direct DB entry.
         price = fetch_crypto_price(holding.get("ticker"))
         source = "CoinGecko"
 
