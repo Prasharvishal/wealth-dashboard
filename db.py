@@ -478,16 +478,36 @@ def record_sell(holding_id, units, amount, date, price=None, provenance=None,
     except Exception:
         prov = (prov + "; " if prov else "") + "bench price unavailable"
 
+    # Codex 097 (lower-severity race): two overlapping record_sell calls could
+    # both validate against the same starting quantity and both commit —
+    # last-writer-wins, silently over-selling. Optimistic-concurrency guard:
+    # BOTH statements fire only while the quantity is still exactly the value
+    # we validated against; a unique token in provenance then proves whether
+    # OUR write is the one that landed. The loser raises cleanly and the user
+    # retries against the fresh quantity.
+    import uuid as _uuid
+    _token = f"[sell:{_uuid.uuid4().hex[:10]}]"
+    prov = (prov + " " if prov else "") + _token
     _atomic_batch([
         ("""INSERT INTO transactions
             (date, holding_id, asset_name, sleeve, kind, amount, units, price,
              bench_units, provenance)
-            VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?)""",
+            SELECT ?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?
+            FROM holdings WHERE id = ? AND quantity = ?""",
          (str(txn_date), holding_id, h["asset_name"], h.get("sleeve"),
-          float(amount), units, price, bench_units, prov)),
-        ("UPDATE holdings SET quantity = ? WHERE id = ?",
-         (new_qty, holding_id)),
+          float(amount), units, price, bench_units, prov,
+          holding_id, current_qty)),
+        ("UPDATE holdings SET quantity = ? WHERE id = ? AND quantity = ?",
+         (new_qty, holding_id, current_qty)),
     ])
+    landed = query_one(
+        "SELECT id FROM transactions WHERE holding_id = ? AND provenance LIKE ?",
+        (holding_id, f"%{_token}%"))
+    if not landed:
+        raise ValueError(
+            "record_sell: the holding's quantity changed while this sell was "
+            "being recorded (another sell/edit got there first) — nothing was "
+            "written; check the current quantity and retry.")
     return current_qty, new_qty
 
 

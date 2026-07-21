@@ -380,6 +380,21 @@ def household_benchmark_panel(all_kept_transactions, total_net_worth, bench_pric
     "— (needs time)" on both sides of the panel, per the review's spec.
     """
     comparison_txns, compared, lacking = build_comparison_set(all_kept_transactions)
+    # Codex 097 ruling: with PARTIAL coverage the terminal-scaling approximation
+    # can flip the comparison's sign badly (their fixture: flat true return
+    # rendered as -98.4%/yr actual vs +197.9%/yr benchmark). So the numeric
+    # comparison is SUPPRESSED whenever any eligible flow lacks bench_units —
+    # the panel says why instead of showing a wrong number. With FULL coverage
+    # no scaling is needed at all: comparison_txns == every kept flow and the
+    # terminal is simply total_net_worth (exact, approximation-free).
+    if lacking > 0:
+        return {
+            "actual_rate": None, "actual_roots": 0,
+            "bench_rate": None, "bench_roots": 0,
+            "compared": compared, "lacking": lacking,
+            "suppressed": True,
+            "comparison_txns": comparison_txns,
+        }
     actual_rate, actual_roots = comparison_actual_xirr(
         comparison_txns, all_kept_transactions, total_net_worth)
     bench_rate, bench_roots, _, _ = compute_benchmark_xirr(comparison_txns, bench_price)
@@ -393,6 +408,7 @@ def household_benchmark_panel(all_kept_transactions, total_net_worth, bench_pric
         "actual_rate": actual_rate, "actual_roots": actual_roots,
         "bench_rate": bench_rate, "bench_roots": bench_roots,
         "compared": compared, "lacking": lacking,
+        "suppressed": False,
         "comparison_txns": comparison_txns,
     }
 

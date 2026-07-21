@@ -1196,22 +1196,26 @@ with tab_start:
         gc1, gc2 = st.columns(2)
         gc1.metric("📈 Your money's growth rate (all flows, since 21 Jul 2026)",
                    returns.fmt_xirr(_hh_xirr, _hh_roots))
-        gc2.metric("vs just-buying-NIFTYBEES (compared flows only)",
-                   returns.fmt_xirr(_panel["actual_rate"], _panel["actual_roots"]),
-                   help=returns.fmt_xirr(_panel["bench_rate"], _panel["bench_roots"])
-                        + " for NIFTYBEES over the same compared flows")
+        if _panel.get("suppressed"):
+            # Codex 097: a partially-covered comparison can flip signs badly —
+            # never show a number here unless every flow has benchmark data.
+            gc2.metric("vs just-buying-NIFTYBEES", "—",
+                       help="comparison suppressed — see note below")
+            gc2.caption(f"⚠ benchmark comparison suppressed: {_panel['lacking']} of "
+                        f"{_panel['compared'] + _panel['lacking']} flows lack "
+                        "benchmark price data (a partial comparison can badly "
+                        "mislead). It re-enables automatically once every flow "
+                        "has data — usually after the next successful backfill.")
+        else:
+            gc2.metric("vs just-buying-NIFTYBEES (same flows, exact)",
+                       returns.fmt_xirr(_panel["actual_rate"], _panel["actual_roots"]),
+                       help=returns.fmt_xirr(_panel["bench_rate"], _panel["bench_roots"])
+                            + " for NIFTYBEES over the same flows")
         st.caption("Forward-measured from the 21 Jul 2026 baseline (epoch-split "
                    "doctrine: pre-baseline gains aren't graded). Early readings "
-                   "swing wildly — trust it after ~3 months. The benchmark panel's "
-                   "terminal value is approximated by scaling total net worth to "
-                   "the compared subset's share of outflow capital — an "
-                   "approximation, not an exact per-holding valuation.")
-        if _panel["lacking"]:
-            st.caption(f"⚠ comparison covers {_panel['compared']} of "
-                       f"{_panel['compared'] + _panel['lacking']} flows "
-                       f"(₹{returns._outflow_basis(_panel['comparison_txns']):,.0f} of "
-                       f"₹{returns._outflow_basis(_kept_txns):,.0f} capital) — "
-                       f"{_panel['lacking']} lacked benchmark price data")
+                   "swing wildly — trust it after ~3 months. The benchmark "
+                   "comparison only renders with full price-data coverage, so "
+                   "both sides are always exact and on identical capital.")
         if _orphan_sets:
             st.caption(f"⚠ {_orphan_sets} orphaned transaction set(s) excluded "
                        "from XIRR — record their SELLs (Deploy This Month → "
