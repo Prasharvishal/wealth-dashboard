@@ -1,17 +1,34 @@
 """PSC exam-strategy section — bolted onto the MAVI Vault Streamlit app.
 
-Fully independent of the Vault's data: never touches wealth.db / Turso. All exam
-persistence (study log, mock scores) lives as JSON under
-`/Users/vishal/Documents/New project/strategy/`. Read-only sources (backtest
-results, question bank, taxonomy, evidence docs) live under the sibling
-`/Users/vishal/Documents/New project/` tree and are loaded fresh on every call
-to render() (no caching across reruns needed — files are small and local).
+v2 (2026-07-30): cloud/mobile persistence + study-power features.
+
+Data-file resolution is two-tier so the SAME code runs locally and on Streamlit
+Community Cloud:
+  1. "local mode" — the absolute "New project" paths (BASE below), when that
+     tree exists on disk (i.e. this Mac).
+  2. "cloud mode" — falls back to ./exam_data/ (bundled COPIES committed into
+     this repo) when the local tree is absent.
+A caption in the UI always shows which source is active.
+
+Persistence (study log / mock scores / error log) now lives in the SAME DB
+layer as the Vault (db.py — Turso over HTTP with local-SQLite fallback), NOT
+JSON. This is what makes "log from the phone" and "log from localhost" write
+to the same place. Tables are exam_study_log / exam_mock_scores /
+exam_error_log, created lazily (CREATE TABLE IF NOT EXISTS, guarded) the first
+time any of them is touched — this module still shares nothing else with the
+Vault (no wealth.db table, no allocation logic). The legacy local JSON files
+(strategy/study_log.json, strategy/mock_scores.json) are imported ONCE into
+the DB on first run (idempotent — skipped if the DB already has rows) so nothing
+logged before v2 is lost. If Turso is unreachable, writes fall back to the JSON
+files with a visible warning — a log is never silently dropped.
 
 Every number surfaced in the UI carries an evidence-tier caption:
   CALCULATED — computed here from the on-disk paper corpus.
-  OFFICIAL   — read from a commission notification (target_engine.py EXAMS).
+  OFFICIAL   — read from a commission notification (target_engine.py EXAMS) or
+               a verified official URL.
   ESTIMATED  — modelled/assumed, editable.
   WEAK       — single-source or small-sample; informational only.
+  CONVERGENT — multiple independent sources agree (toppers_evidence.md).
 
 Entry point: exam_strategy.render() — called from app.py when the sidebar
 "📚 Exam" mode is selected, before any Vault data loads.
@@ -30,24 +47,65 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+import db  # shared Turso/SQLite persistence layer — reused verbatim, not duplicated
+
 # ---------------------------------------------------------------------------
-# Paths — all under the exam project root, never inside wealth_dashboard/.
+# Paths — two-tier resolution: local "New project" tree first, else the
+# bundled ./exam_data/ copies committed into this repo (cloud mode).
 # ---------------------------------------------------------------------------
 BASE = Path("/Users/vishal/Documents/New project")
 PROC = BASE / "data" / "processed"
 CONFIG = BASE / "config"
 STRATEGY_DIR = BASE / "strategy"
 REPORTS = BASE / "reports"
+PDF_DIR = BASE / "data" / "raw" / "pdfs"
+MANIFEST_FILE = PROC / "uppsc_harvest_manifest.csv"
 
-BACKTEST_FILE = PROC / "backtest_g2_results.json"
-QBANK_REPAIRED = PROC / "question_bank_repaired.csv"
-QBANK_RECOVERED = PROC / "question_bank_recovered.csv"
-TAXONOMY_FILE = CONFIG / "topic_taxonomy_v2.json"
+CLOUD_DATA = Path(__file__).parent / "exam_data"
+
+LOCAL_MODE = BASE.exists()
+
+if LOCAL_MODE:
+    BACKTEST_FILE = PROC / "backtest_g2_results.json"
+    QBANK_REPAIRED = PROC / "question_bank_repaired.csv"
+    QBANK_RECOVERED = PROC / "question_bank_recovered.csv"
+    TAXONOMY_FILE = CONFIG / "topic_taxonomy_v2.json"
+else:
+    BACKTEST_FILE = CLOUD_DATA / "backtest_g2_results.json"
+    QBANK_REPAIRED = CLOUD_DATA / "question_bank_repaired.csv"
+    QBANK_RECOVERED = CLOUD_DATA / "question_bank_recovered.csv"
+    TAXONOMY_FILE = CLOUD_DATA / "topic_taxonomy_v2.json"
+
+# These have no cloud copies by design (§Finish note / task spec): the toppers
+# report, charter, and PDF corpus stay local-only. Cloud mode degrades them
+# gracefully (existing _warn_missing / dedicated messages), never crashes.
 TOPPERS_FILE = REPORTS / "toppers_evidence.md"
 CHARTER_FILE = BASE / "STRATEGY_CHARTER.md"
 
-STUDY_LOG_FILE = STRATEGY_DIR / "study_log.json"
-MOCK_SCORES_FILE = STRATEGY_DIR / "mock_scores.json"
+# Legacy JSON persistence — read-only now except for the one-time migration
+# into the DB tables below. Never written to going forward except as the
+# fallback path when Turso/SQLite itself is unreachable. In cloud mode
+# STRATEGY_DIR doesn't exist on disk at all (it's part of the local-only
+# "New project" tree) — the fallback write path uses a local dir next to
+# this file instead, so a Turso outage on Cloud still has somewhere durable
+# (for that container's lifetime) to land instead of raising on a missing dir.
+if LOCAL_MODE:
+    STUDY_LOG_FILE = STRATEGY_DIR / "study_log.json"
+    MOCK_SCORES_FILE = STRATEGY_DIR / "mock_scores.json"
+    ERROR_LOG_FILE = STRATEGY_DIR / "error_log.json"  # fallback only; no legacy v1 file existed
+else:
+    _FALLBACK_DIR = Path(__file__).parent / "exam_data" / "_fallback"
+    STUDY_LOG_FILE = _FALLBACK_DIR / "study_log.json"
+    MOCK_SCORES_FILE = _FALLBACK_DIR / "mock_scores.json"
+    ERROR_LOG_FILE = _FALLBACK_DIR / "error_log.json"
+
+
+def data_source_caption() -> None:
+    """Small caption showing which data-source tier is active (task Part A.1)."""
+    if LOCAL_MODE:
+        st.caption(f"📁 Data source: **local mode** — reading from `{BASE}`")
+    else:
+        st.caption(f"☁️ Data source: **cloud mode** — reading bundled copies from `{CLOUD_DATA}`")
 
 # Import the real target_engine module (ported logic, not duplicated) —
 # strategy/ is a plain directory (no __init__.py), so add it to sys.path.
@@ -145,6 +203,56 @@ def classify_text(text: str, rules) -> str:
     return best_topic
 
 
+# ---------------------------------------------------------------------------
+# Junk-OCR / quality filter (added after live user testing of v2's Question
+# Bank tab surfaced garbled Devanagari-as-Latin OCR rows, e.g. "qTma ap
+# ffi-ffitr3 q5q dr alis q5nga qffiq€f*@ flfaRI" — these pass any ASCII-only
+# check since OCR garbage is still Latin characters, just not English words.
+# ---------------------------------------------------------------------------
+_ENGLISH_SIGNAL_WORDS = {
+    "the", "of", "in", "is", "which", "what", "who", "following", "correct",
+    "india", "answer", "given", "above", "below", "not", "are", "was", "with", "from",
+}
+_WORD_RE = re.compile(r"[A-Za-z]+")
+_MIN_ENGLISH_SIGNAL_WORDS = 3
+
+# Paper names that are inherently Hindi-content (their OCR is real Hindi text
+# mis-rendered as Latin garbage, not fixable by better English-word matching —
+# task item #3: exclude by paper-name pattern, with an opt-in checkbox).
+_HINDI_PAPER_RE = re.compile(r"hindi|language|literature|essay", re.IGNORECASE)
+
+
+def is_english_like(text: str) -> bool:
+    """True if `text` contains >= _MIN_ENGLISH_SIGNAL_WORDS distinct common
+    English function/exam words (case-insensitive, word-boundary). Garbled
+    OCR (Devanagari rendered as Latin noise) is still ASCII but essentially
+    never contains real English function words, so this catches it without
+    needing language-detection libraries."""
+    if not text:
+        return False
+    words = {w.lower() for w in _WORD_RE.findall(text)}
+    return len(words & _ENGLISH_SIGNAL_WORDS) >= _MIN_ENGLISH_SIGNAL_WORDS
+
+
+def is_hindi_paper(paper: str) -> bool:
+    return bool(paper) and bool(_HINDI_PAPER_RE.search(str(paper)))
+
+
+def _clean_option(val) -> str:
+    """Empty/NaN/whitespace-only option fields collapse to '' — pandas
+    concat can introduce real float NaN for a column absent from one of the
+    two source CSVs (repaired.csv has no option_* columns at all), which
+    later stringifies to the literal text 'nan' if not guarded here."""
+    if val is None:
+        return ""
+    try:
+        if pd.isna(val):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(val).strip()
+
+
 @st.cache_data(show_spinner=False)
 def load_question_bank() -> pd.DataFrame:
     """Union of repaired (has topic) + recovered (has options, needs classify)."""
@@ -186,6 +294,13 @@ def load_question_bank() -> pd.DataFrame:
     for col in ("option_a", "option_b", "option_c", "option_d"):
         if col not in df.columns:
             df[col] = ""
+        # Guard against pd.concat-introduced NaN (see _clean_option docstring)
+        # AND genuine empty/whitespace cells — both collapse to "".
+        df[col] = df[col].apply(_clean_option)
+
+    text_col = df["question_text"] if "question_text" in df.columns else pd.Series([""] * len(df))
+    df["_low_quality"] = ~text_col.fillna("").apply(is_english_like)
+    df["_hindi_paper"] = df["paper"].fillna("").apply(is_hindi_paper) if "paper" in df.columns else False
     return df
 
 
@@ -208,8 +323,54 @@ def load_charter_md() -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Study log + mock scores persistence (JSON, local, exam-only — never wealth.db)
+# Study log / mock scores / error log persistence — v2: db.py (Turso over HTTP
+# with local-SQLite fallback), REUSING db.py's own query/execute/query_scalar
+# helpers verbatim (same pattern app.py uses for every Vault table). This is
+# what makes phone-logged and localhost-logged entries land in the SAME place.
+#
+# Legacy JSON files (study_log.json / mock_scores.json) are migrated into the
+# DB tables exactly once, idempotently: the migration checks the DB's row
+# count first and only imports if the DB side is still empty AND the JSON
+# file has entries — so re-running render() a thousand times never duplicates
+# rows, and a DB that already has real data is never clobbered by a stale
+# JSON file.
+#
+# If the DB is unreachable (Turso down AND local sqlite3 write fails for some
+# reason), every writer below falls back to the JSON file and raises a
+# visible st.warning — a log is never silently dropped (task Part A.3).
 # ---------------------------------------------------------------------------
+_EXAM_TABLES_READY = False
+
+
+def _ensure_exam_tables() -> bool:
+    """CREATE TABLE IF NOT EXISTS for all three exam tables, guarded.
+
+    Returns True if the DB layer looks usable, False if even the guarded
+    create failed (caller should fall back to JSON). Cheap to call repeatedly
+    — cached per-process via _EXAM_TABLES_READY once it succeeds once.
+    """
+    global _EXAM_TABLES_READY
+    if _EXAM_TABLES_READY:
+        return True
+    try:
+        db.execute("""CREATE TABLE IF NOT EXISTS exam_study_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT, exam TEXT, topic TEXT, hours REAL, type TEXT,
+            note TEXT, created_at TEXT)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS exam_mock_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT, exam TEXT, score REAL, max_score REAL,
+            note TEXT, created_at TEXT)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS exam_error_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT, exam TEXT, topic TEXT, count INTEGER,
+            note TEXT, created_at TEXT)""")
+        _EXAM_TABLES_READY = True
+        return True
+    except Exception:
+        return False
+
+
 def _read_json_list(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -230,24 +391,166 @@ def _write_json_list(path: Path, rows: list[dict]) -> bool:
         return False
 
 
+def _migrate_json_to_db_once() -> None:
+    """One-time, idempotent import of legacy JSON logs into the DB tables.
+
+    Idempotency guard: only imports into a table that is still EMPTY (row
+    count checked first) AND only if the legacy JSON file actually has
+    entries. A DB that already has rows (from this migration or from normal
+    use) is never touched again — safe to call on every render().
+    """
+    if not _ensure_exam_tables():
+        return
+    try:
+        study_count = db.query_scalar("SELECT COUNT(*) FROM exam_study_log") or 0
+        if study_count == 0:
+            legacy = _read_json_list(STUDY_LOG_FILE)
+            if legacy:
+                now = datetime.now().isoformat(timespec="seconds")
+                db.executemany(
+                    "INSERT INTO exam_study_log (date, exam, topic, hours, type, note, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [(r.get("date"), r.get("exam"), r.get("topic"), r.get("hours"),
+                      r.get("type"), r.get("note"), now) for r in legacy],
+                )
+    except Exception:
+        pass  # migration is best-effort; never blocks normal render()
+
+    try:
+        mock_count = db.query_scalar("SELECT COUNT(*) FROM exam_mock_scores") or 0
+        if mock_count == 0:
+            legacy = _read_json_list(MOCK_SCORES_FILE)
+            if legacy:
+                now = datetime.now().isoformat(timespec="seconds")
+                db.executemany(
+                    "INSERT INTO exam_mock_scores (date, exam, score, max_score, note, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    [(r.get("date"), r.get("exam"), r.get("score"),
+                      r.get("max") if r.get("max") is not None else r.get("max_score"),
+                      r.get("note"), now) for r in legacy],
+                )
+    except Exception:
+        pass
+
+
 def load_study_log() -> list[dict]:
+    if _ensure_exam_tables():
+        try:
+            rows = db.query("SELECT * FROM exam_study_log ORDER BY date")
+            return rows
+        except Exception:
+            pass
     return _read_json_list(STUDY_LOG_FILE)
 
 
 def append_study_log(entry: dict) -> bool:
-    rows = load_study_log()
+    if _ensure_exam_tables():
+        try:
+            db.execute(
+                "INSERT INTO exam_study_log (date, exam, topic, hours, type, note, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (entry.get("date"), entry.get("exam"), entry.get("topic"),
+                 entry.get("hours"), entry.get("type"), entry.get("note"),
+                 datetime.now().isoformat(timespec="seconds")),
+            )
+            return True
+        except Exception as exc:
+            st.warning(f"⚠ Could not write to the shared DB ({exc}) — falling back to local "
+                       "JSON so this entry isn't lost. It will NOT sync to your phone until "
+                       "the DB is reachable again.")
+    rows = _read_json_list(STUDY_LOG_FILE)
     rows.append(entry)
     return _write_json_list(STUDY_LOG_FILE, rows)
 
 
 def load_mock_scores() -> list[dict]:
-    return _read_json_list(MOCK_SCORES_FILE)
+    if _ensure_exam_tables():
+        try:
+            rows = db.query("SELECT * FROM exam_mock_scores ORDER BY date")
+            # normalise 'max_score' -> 'max' key used by the rest of this module, and
+            # (re)compute 'pct' rather than trusting a stored value — the DB schema
+            # (task spec) has no pct column, only score/max_score.
+            for r in rows:
+                r.setdefault("max", r.get("max_score"))
+                try:
+                    r["pct"] = round(100 * float(r["score"]) / float(r["max"]), 1) if r.get("max") else None
+                except (TypeError, ValueError, ZeroDivisionError):
+                    r["pct"] = None
+            return rows
+        except Exception:
+            pass
+    rows = _read_json_list(MOCK_SCORES_FILE)
+    for r in rows:
+        if r.get("pct") is None and r.get("max"):
+            try:
+                r["pct"] = round(100 * float(r["score"]) / float(r["max"]), 1)
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+    return rows
 
 
 def append_mock_score(entry: dict) -> bool:
-    rows = load_mock_scores()
+    if _ensure_exam_tables():
+        try:
+            db.execute(
+                "INSERT INTO exam_mock_scores (date, exam, score, max_score, note, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (entry.get("date"), entry.get("exam"), entry.get("score"),
+                 entry.get("max"), entry.get("note"),
+                 datetime.now().isoformat(timespec="seconds")),
+            )
+            return True
+        except Exception as exc:
+            st.warning(f"⚠ Could not write to the shared DB ({exc}) — falling back to local "
+                       "JSON so this score isn't lost. It will NOT sync to your phone until "
+                       "the DB is reachable again.")
+    rows = _read_json_list(MOCK_SCORES_FILE)
     rows.append(entry)
     return _write_json_list(MOCK_SCORES_FILE, rows)
+
+
+def load_error_log() -> list[dict]:
+    if _ensure_exam_tables():
+        try:
+            return db.query("SELECT * FROM exam_error_log ORDER BY date")
+        except Exception:
+            pass
+    return _read_json_list(ERROR_LOG_FILE)
+
+
+def append_error_log(entry: dict) -> bool:
+    if _ensure_exam_tables():
+        try:
+            db.execute(
+                "INSERT INTO exam_error_log (date, exam, topic, count, note, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (entry.get("date"), entry.get("exam"), entry.get("topic"),
+                 entry.get("count"), entry.get("note"),
+                 datetime.now().isoformat(timespec="seconds")),
+            )
+            return True
+        except Exception as exc:
+            st.warning(f"⚠ Could not write to the shared DB ({exc}) — falling back to local "
+                       "JSON so this entry isn't lost. It will NOT sync to your phone until "
+                       "the DB is reachable again.")
+    rows = _read_json_list(ERROR_LOG_FILE)
+    rows.append(entry)
+    return _write_json_list(ERROR_LOG_FILE, rows)
+
+
+def error_log_hits_last_n_days(error_log: list[dict], topic: str, today: date, n: int = 60) -> int:
+    """Count of exam_error_log 'count' values logged for `topic` in the last n days."""
+    total = 0
+    for row in error_log:
+        if row.get("topic") != topic:
+            continue
+        d = _parse_date(row.get("date"))
+        if d and (today - d).days <= n and (today - d).days >= 0:
+            try:
+                total += int(row.get("count") or 0)
+            except (TypeError, ValueError):
+                pass
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -334,9 +637,16 @@ def next_due_stage(topic: str, study_log: list[dict], today: date) -> dict | Non
     return None
 
 
-def compute_priority_queue(exam: str, study_log: list[dict], today: date, top_n: int = 5) -> list[dict]:
+ERROR_LOG_WEIGHT = 1.5
+ERROR_LOG_CAP_DAYS = 60
+ERROR_LOG_CAP_HITS = 3
+
+
+def compute_priority_queue(exam: str, study_log: list[dict], today: date, top_n: int = 5,
+                            error_log: list[dict] | None = None) -> list[dict]:
     tiers = emphasis_tier_map(exam)
     last_touch = _last_touch_dates(study_log)
+    error_log = error_log or []
     rows = []
     for topic, tier in tiers.items():
         touched = last_touch.get(topic)
@@ -346,13 +656,17 @@ def compute_priority_queue(exam: str, study_log: list[dict], today: date, top_n:
         overdue_bonus = 0
         if stage and stage["due"] <= today:
             overdue_bonus = 2
-        score = TIER_WEIGHT.get(tier, 1) * staleness_score + overdue_bonus
+        error_hits = min(error_log_hits_last_n_days(error_log, topic, today, ERROR_LOG_CAP_DAYS),
+                          ERROR_LOG_CAP_HITS)
+        error_bonus = ERROR_LOG_WEIGHT * error_hits
+        score = TIER_WEIGHT.get(tier, 1) * staleness_score + overdue_bonus + error_bonus
         rows.append({
             "topic": topic,
             "tier": tier,
             "staleness_days": staleness_days,
             "last_touched": touched.isoformat() if touched else "never",
             "revision_overdue": overdue_bonus > 0,
+            "error_hits_60d": error_hits,
             "score": round(score, 3),
         })
     rows.sort(key=lambda r: r["score"], reverse=True)
@@ -390,9 +704,16 @@ def current_streak(study_log: list[dict], today: date) -> int:
 def render() -> None:
     st.markdown("## 📚 PSC Exam Strategy")
     st.caption(
-        "Independent of the Vault — persistence in `strategy/*.json` under the "
-        "exam project folder. Never touches wealth.db."
+        "v2 — persistence in the shared Vault DB (Turso/SQLite via db.py), same "
+        "backend as the Vault tables but its own tables — never touches Vault "
+        "sleeves/holdings/goals. Logging from your phone (cloud) and localhost "
+        "now write to the SAME database."
     )
+    data_source_caption()
+    st.caption(f"DB backend: **{db.backend_name()}**"
+               + (f" (Turso unreachable: {db.turso_error()})" if db.turso_error() else ""))
+
+    _migrate_json_to_db_once()
 
     if _target_engine is None:
         st.warning(
@@ -402,30 +723,38 @@ def render() -> None:
 
     today = date.today()
     study_log = load_study_log()
-    if not STUDY_LOG_FILE.exists():
+    error_log = load_error_log()
+    if not study_log:
         st.info(
-            "No study log yet at `strategy/study_log.json` — Today/Revision tabs "
-            "will show empty state until you log your first session."
+            "No study log yet — Today/Revision tabs will show empty state until "
+            "you log your first session."
         )
 
+    # PYQ-first handoff (task #5): a "PYQs →" button on the Today queue sets
+    # this session-state key; the Question Bank tab reads + clears it so the
+    # pre-filter applies exactly once per click, not on every rerun after.
+    _qbank_prefilter = st.session_state.pop("_qbank_prefilter_topic", None)
+
     (tab_today, tab_priorities, tab_qbank, tab_calc,
-     tab_revision, tab_resources, tab_charter) = st.tabs([
+     tab_revision, tab_papers, tab_resources, tab_charter) = st.tabs([
         "📌 Today", "🎯 Priorities", "📝 Question Bank", "🧮 Attack Calculator",
-        "🔁 Revision", "📚 Resources", "🧭 Charter",
+        "🔁 Revision", "📄 Paper Library", "📚 Resources", "🧭 Charter",
     ])
 
     with tab_today:
-        _render_today(study_log, today)
+        _render_today(study_log, today, error_log)
     with tab_priorities:
         _render_priorities()
     with tab_qbank:
-        _render_question_bank()
+        _render_question_bank(prefilter_topic=_qbank_prefilter)
     with tab_calc:
         _render_attack_calculator()
     with tab_revision:
         _render_revision(study_log, today)
+    with tab_papers:
+        _render_paper_library()
     with tab_resources:
-        _render_resources()
+        _render_resources(study_log, today)
     with tab_charter:
         _render_charter()
 
@@ -433,7 +762,8 @@ def render() -> None:
 # ---------------------------------------------------------------------------
 # Tab 1 — Today
 # ---------------------------------------------------------------------------
-def _render_today(study_log: list[dict], today: date) -> None:
+def _render_today(study_log: list[dict], today: date, error_log: list[dict] | None = None) -> None:
+    error_log = error_log or []
     days_to_prelims = (UPPSC_PRELIMS_DATE - today).days
     days_to_k1 = (K1_GATE_DATE - today).days
 
@@ -445,19 +775,32 @@ def _render_today(study_log: list[dict], today: date) -> None:
     _tier_caption(TIER_OFFICIAL, "dates fixed in STRATEGY_CHARTER.md / user's exam calendar")
 
     st.markdown("#### Study queue — top 5 right now")
-    queue = compute_priority_queue("UPPSC", study_log, today, top_n=5)
+    queue = compute_priority_queue("UPPSC", study_log, today, top_n=5, error_log=error_log)
     if queue:
-        qdf = pd.DataFrame(queue)[["topic", "tier", "staleness_days", "last_touched", "revision_overdue"]]
-        qdf.columns = ["Topic", "Emphasis", "Days stale (cap 30)", "Last touched", "Revision overdue"]
+        qdf = pd.DataFrame(queue)[["topic", "tier", "staleness_days", "last_touched",
+                                    "revision_overdue", "error_hits_60d"]]
+        qdf.columns = ["Topic", "Emphasis", "Days stale (cap 30)", "Last touched",
+                       "Revision overdue", "Error-log hits (60d, cap 3)"]
         st.dataframe(qdf, use_container_width=True, hide_index=True)
         st.caption(
             "why these: score = tier weight (DEEP=3 / STANDARD=2 / ONE-PASS=1) × "
-            "staleness/30, +2 if a revision is overdue. Highest score first. "
+            "staleness/30, +2 if a revision is overdue, +1.5 × error-log hits for "
+            "that topic in the last 60 days (capped at 3 hits). Highest score first. "
             "Primary exam = UPPSC (until 2026-12-06 per STRATEGY_CHARTER.md §2)."
         )
+        st.markdown("**Jump to PYQs for a topic:**")
+        pyq_cols = st.columns(min(len(queue), 5))
+        for i, row in enumerate(queue):
+            if pyq_cols[i % len(pyq_cols)].button(f"PYQs → {row['topic'][:22]}", key=f"pyq_btn_{i}",
+                                                    use_container_width=True):
+                st.session_state["_qbank_prefilter_topic"] = row["topic"]
+                st.session_state["_switch_to_qbank_hint"] = True
+                st.rerun()
+        if st.session_state.pop("_switch_to_qbank_hint", False):
+            st.info("Filter set — open the **📝 Question Bank** tab above to see it applied.")
     else:
         st.info("Priority engine has no taxonomy topics to rank — check config/topic_taxonomy_v2.json.")
-    _tier_caption(TIER_CALCULATED, "deterministic score from backtest keep-list + study_log.json")
+    _tier_caption(TIER_CALCULATED, "deterministic score from backtest keep-list + study log + error log")
 
     st.markdown("#### This month")
     hrs = hours_this_month(study_log, today)
@@ -465,7 +808,7 @@ def _render_today(study_log: list[dict], today: date) -> None:
                 text=f"{hrs:.1f}h / {MONTH_HOUR_TARGET}h target this month")
     streak = current_streak(study_log, today)
     st.metric("Current streak", f"{streak} day{'s' if streak != 1 else ''}")
-    _tier_caption(TIER_CALCULATED, "summed from strategy/study_log.json entries")
+    _tier_caption(TIER_CALCULATED, "summed from the exam_study_log DB table")
 
     st.markdown("#### Quick-log a session")
     topics = taxonomy_topics()
@@ -492,11 +835,94 @@ def _render_today(study_log: list[dict], today: date) -> None:
                 st.success(f"Logged {hours}h — {topic} ({study_type}) on {log_date.isoformat()}")
                 st.rerun()
 
+    _render_hindi_drill_tracker(study_log, today)
+
+
+# ---------------------------------------------------------------------------
+# Hindi drill tracker (task #6) — UPPSC General Hindi = 150 MERIT marks,
+# confirmed in toppers_evidence.md Part 1 (not qualifying-only, contra the
+# widespread coaching claim). His weakest high-stakes area per that report.
+# ---------------------------------------------------------------------------
+HINDI_SYLLABUS_SECTIONS = [
+    "Comprehension of a given passage",
+    "संक्षेपण (precis writing)",
+    "Official / semi-official letters, telegram, office order, notification, circular",
+    "Word knowledge — prefix/suffix, antonyms, one-word-for-phrase, spelling & sentence correction",
+    "Idioms and proverbs",
+]
+HINDI_DRILL_TARGET_MIN = 30
+
+
+def _render_hindi_drill_tracker(study_log: list[dict], today: date) -> None:
+    st.divider()
+    st.markdown("#### 🇮🇳 Hindi drill tracker")
+    st.caption(
+        "UPPSC General Hindi is **150 MERIT marks** — counted, not qualifying-only "
+        "(the widespread coaching claim to the contrary is wrong; see Resources tab). "
+        "This is his weakest high-stakes area."
+    )
+
+    hindi_rows = [r for r in study_log if r.get("type") == "hindi_drill"]
+    hindi_days = {d for d in (_parse_date(r.get("date")) for r in hindi_rows) if d}
+    streak = 0
+    cursor = today
+    while cursor in hindi_days:
+        streak += 1
+        cursor -= timedelta(days=1)
+    today_minutes = sum(
+        float(r.get("hours") or 0) * 60
+        for r in hindi_rows if _parse_date(r.get("date")) == today
+    )
+
+    hc1, hc2, hc3 = st.columns(3)
+    hc1.metric("Hindi streak", f"{streak} day{'s' if streak != 1 else ''}")
+    hc2.metric("Today", f"{today_minutes:.0f} min", help=f"Target {HINDI_DRILL_TARGET_MIN} min/day")
+    hc3.metric("Total sessions logged", len(hindi_rows))
+    _tier_caption(TIER_CALCULATED, "type='hindi_drill' rows in exam_study_log")
+
+    with st.expander("Official 5-section syllabus (reference checklist)"):
+        for i, section in enumerate(HINDI_SYLLABUS_SECTIONS, 1):
+            st.checkbox(f"{i}. {section}", key=f"hindi_syllabus_ref_{i}",
+                        help="Reference only — ticking just tracks your own read-through, "
+                             "not persisted separately from this session.")
+        _tier_caption(TIER_OFFICIAL, "reports/toppers_evidence.md Part 1 — official Advt A-1/E-1 "
+                                      "Appendix-2; NO translation/अनुवाद section exists (verified "
+                                      "absent from syllabus + actual 2018/2021 papers)")
+
+    st.info(
+        '**Siddharth Gupta, UPPCS 2023 Rank 1:** *"Dont ignore Hindi paper (especially for '
+        'English medium candidates). It a low hanging fruit. Practice hindi daily."* '
+        "He had scored poorly in Hindi in a previous attempt and fixed it."
+    )
+    _tier_caption(TIER_OFFICIAL, "reports/toppers_evidence.md Part 5 — direct topper quote")
+
+    with st.form("hindi_drill_form", clear_on_submit=True):
+        hd1, hd2 = st.columns(2)
+        hd_date = hd1.date_input("Date", value=today, key="hindi_date")
+        hd_minutes = hd2.number_input("Minutes", min_value=0, max_value=240, step=5,
+                                       value=HINDI_DRILL_TARGET_MIN, key="hindi_minutes")
+        hd_note = st.text_input("What did you drill? (optional)", key="hindi_note")
+        hd_submit = st.form_submit_button(f"Log Hindi drill (target {HINDI_DRILL_TARGET_MIN} min/day)",
+                                           use_container_width=True)
+        if hd_submit:
+            entry = {
+                "date": hd_date.isoformat(), "exam": "UPPSC", "topic": "General Hindi",
+                "hours": round(hd_minutes / 60.0, 3), "type": "hindi_drill", "note": hd_note,
+            }
+            if append_study_log(entry):
+                st.success(f"Logged {hd_minutes} min Hindi drill on {hd_date.isoformat()}")
+                st.rerun()
+
 
 # ---------------------------------------------------------------------------
 # Tab 2 — Priorities
 # ---------------------------------------------------------------------------
 def _render_priorities() -> None:
+    st.caption(
+        "📖 Doctrine: complete ~80% of Mains-relevant study BEFORE prelims — for "
+        "UPPSC, UP-GK study serves both prelims and the 400-mark GS-V/VI mains "
+        "papers (source: Satvik Srivastava, Rank 3, 2023)."
+    )
     results = load_backtest_results()
     if not results:
         _warn_missing(BACKTEST_FILE, "Backtest results")
@@ -565,7 +991,7 @@ def _render_priorities() -> None:
 # ---------------------------------------------------------------------------
 # Tab 3 — Question Bank
 # ---------------------------------------------------------------------------
-def _render_question_bank() -> None:
+def _render_question_bank(prefilter_topic: str | None = None) -> None:
     df = load_question_bank()
     if df.empty:
         _warn_missing(QBANK_REPAIRED, "Question bank")
@@ -575,11 +1001,29 @@ def _render_question_bank() -> None:
     _tier_caption(TIER_CALCULATED, "question_bank_repaired.csv + question_bank_recovered.csv; "
                                     "recovered-file topics auto-classified on the fly with taxonomy v2")
 
+    n_low_quality = int(df["_low_quality"].sum())
+    n_hindi_paper = int(df["_hindi_paper"].sum())
+    qc1, qc2 = st.columns(2)
+    show_low_quality = qc1.checkbox(
+        f"show low-quality OCR rows ({n_low_quality:,} hidden)", value=False, key="qb_show_low_quality")
+    show_hindi_papers = qc2.checkbox(
+        f"include Hindi-paper rows ({n_hindi_paper:,} hidden)", value=False, key="qb_show_hindi")
+    st.caption(
+        "Default view hides rows whose OCR text contains fewer than 3 distinct common English "
+        "words (garbled Devanagari-as-Latin OCR noise, e.g. \"qTma ap ffi-ffitr3 q5q dr alis\") "
+        "and rows from papers matching hindi/language/literature/essay (inherently Hindi-content, "
+        "so their OCR is real Hindi text mis-rendered, not fixable by the English-word check)."
+    )
+
     fc1, fc2, fc3, fc4 = st.columns(4)
     exam_opts = ["(all)"] + sorted(x for x in df["exam"].unique() if x)
     year_opts = ["(all)"] + sorted((x for x in df["year"].unique() if x), reverse=True)
     stage_opts = ["(all)"] + sorted(x for x in df["stage"].unique() if x)
     topic_opts = ["(all)"] + sorted(x for x in df["topic"].unique() if x)
+
+    if prefilter_topic and prefilter_topic in topic_opts:
+        st.session_state["qb_topic"] = prefilter_topic
+        st.success(f"Pre-filtered to **{prefilter_topic}** (from the Today queue's PYQs button).")
 
     exam_f = fc1.selectbox("Exam", exam_opts, key="qb_exam")
     year_f = fc2.selectbox("Year", year_opts, key="qb_year")
@@ -588,6 +1032,10 @@ def _render_question_bank() -> None:
     search = st.text_input("Text search", key="qb_search")
 
     filtered = df
+    if not show_low_quality:
+        filtered = filtered[~filtered["_low_quality"]]
+    if not show_hindi_papers:
+        filtered = filtered[~filtered["_hindi_paper"]]
     if exam_f != "(all)":
         filtered = filtered[filtered["exam"] == exam_f]
     if year_f != "(all)":
@@ -615,12 +1063,16 @@ def _render_question_bank() -> None:
         with st.container(border=True):
             st.markdown(f"**{header}**")
             st.write(row.get("question_text", ""))
-            opts = [row.get(c, "") for c in ("option_a", "option_b", "option_c", "option_d")]
-            if has_options_col and any(str(o).strip() for o in opts):
+            opts = [_clean_option(row.get(c, "")) for c in ("option_a", "option_b", "option_c", "option_d")]
+            non_empty_opts = [o for o in opts if o]
+            # Practice mode only when there's something real to reveal — a
+            # row with 0-1 non-empty options (post-nan-cleanup) gets no
+            # expander rather than an empty/near-empty one (task fix #2).
+            if has_options_col and len(non_empty_opts) >= 2:
                 with st.expander("Practice mode — reveal options"):
                     labels = ["a", "b", "c", "d"]
                     for lbl, opt in zip(labels, opts):
-                        if str(opt).strip():
+                        if opt:
                             st.write(f"**{lbl})** {opt}")
     st.caption(f"Page {page} of {n_pages} · {page_size}/page")
 
@@ -762,13 +1214,122 @@ def _render_revision(study_log: list[dict], today: date) -> None:
         "topic. Logging a 'revision' entry for that topic on/after a due date "
         "advances the schedule to the next stage."
     )
-    _tier_caption(TIER_CALCULATED, "derived from strategy/study_log.json — no separate state file")
+    _tier_caption(TIER_CALCULATED, "derived from the exam_study_log DB table — no separate state file")
+
+
+# ---------------------------------------------------------------------------
+# Tab (new) — Paper Library (task #7): the harvested official papers. This is
+# his mock-exam source — real past papers, not third-party recompilations.
+# ---------------------------------------------------------------------------
+_PAPER_FILENAME_RE = re.compile(
+    r"^(?P<exam>uppsc|bpsc|jpsc)_src_[0-9a-f]+_(?P<rest>.+)\.pdf$", re.IGNORECASE)
+_PAPER_YEAR_RE = re.compile(r"(20\d{2})")
+_PAPER_STAGE_RE = re.compile(r"\b(pre|prelim|mains|main)\b", re.IGNORECASE)
+
+
+def _parse_paper_filename(fname: str) -> dict:
+    """Best-effort exam/year/paper parse from a harvested PDF's filename.
+
+    Never invents data — any field that can't be found from the filename
+    text renders as '?' rather than a guess.
+    """
+    m = _PAPER_FILENAME_RE.match(fname)
+    exam = m.group("exam").upper() if m else "?"
+    rest = m.group("rest") if m else fname
+    rest_words = rest.replace("-", " ")
+    ym = _PAPER_YEAR_RE.search(rest_words)
+    year = ym.group(1) if ym else "?"
+    sm = _PAPER_STAGE_RE.search(rest_words)
+    stage = "Prelims" if sm and sm.group(1).lower().startswith("pre") else (
+        "Mains" if sm else "?")
+    # paper label = whatever's left after stripping exam/year/stage boilerplate words
+    label = rest_words
+    return {"exam": exam, "year": year, "stage": stage, "paper_label": label, "filename": fname}
+
+
+@st.cache_data(show_spinner=False)
+def load_paper_manifest() -> pd.DataFrame:
+    if not MANIFEST_FILE.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(MANIFEST_FILE, dtype=str, keep_default_na=False)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _render_paper_library() -> None:
+    st.markdown("#### 📄 Paper Library — harvested official papers")
+    st.caption(
+        "His mock-exam source: real past papers, not third-party recompilations. "
+        "Filtered to UPPSC-harvested files (uppsc_* filenames) plus any file with a "
+        "manifest row — see reports/uppsc_harvest_report.md for provenance."
+    )
+
+    if not LOCAL_MODE:
+        st.info(
+            "📄 Papers available in **local mode only** — the PDF corpus "
+            f"({PDF_DIR}) isn't bundled into this cloud deployment (too large / "
+            "copyright-sensitive to commit). Open this app on the Mac to download."
+        )
+        return
+
+    if not PDF_DIR.exists():
+        _warn_missing(PDF_DIR, "PDF corpus directory")
+        return
+
+    manifest = load_paper_manifest()
+    manifest_files = set()
+    if not manifest.empty and "local_file" in manifest.columns:
+        manifest_files = {Path(p).name for p in manifest["local_file"] if p}
+
+    all_files = sorted(p.name for p in PDF_DIR.glob("*.pdf"))
+    uppsc_files = [f for f in all_files if f.lower().startswith("uppsc_")]
+    # union with any manifest-listed file not already caught by the uppsc_ prefix
+    extra_manifest_files = sorted(manifest_files - set(uppsc_files))
+    shown_files = uppsc_files + [f for f in extra_manifest_files if (PDF_DIR / f).exists()]
+
+    if not shown_files:
+        st.info("No UPPSC papers found in the local PDF corpus yet.")
+        return
+
+    rows = [_parse_paper_filename(f) for f in shown_files]
+    rows.sort(key=lambda r: (r["year"], r["stage"], r["paper_label"]), reverse=True)
+
+    st.write(f"**{len(rows)}** papers available.")
+    fc1, fc2 = st.columns(2)
+    year_opts = ["(all)"] + sorted({r["year"] for r in rows}, reverse=True)
+    stage_opts = ["(all)"] + sorted({r["stage"] for r in rows})
+    year_f = fc1.selectbox("Year", year_opts, key="paper_year")
+    stage_f = fc2.selectbox("Stage", stage_opts, key="paper_stage")
+
+    filtered_rows = rows
+    if year_f != "(all)":
+        filtered_rows = [r for r in filtered_rows if r["year"] == year_f]
+    if stage_f != "(all)":
+        filtered_rows = [r for r in filtered_rows if r["stage"] == stage_f]
+
+    for r in filtered_rows:
+        path = PDF_DIR / r["filename"]
+        with st.container(border=True):
+            cc1, cc2 = st.columns([4, 1])
+            cc1.markdown(f"**{r['exam']} {r['year']} · {r['stage']}** — {r['paper_label']}")
+            try:
+                data = path.read_bytes()
+                cc2.download_button("Download", data=data, file_name=r["filename"],
+                                     mime="application/pdf", key=f"dl_{r['filename']}",
+                                     use_container_width=True)
+            except Exception as exc:
+                cc2.caption(f"unreadable: {exc}")
+    _tier_caption(TIER_OFFICIAL, "data/raw/pdfs/ harvested from official commission sites — "
+                                  "see reports/uppsc_harvest_report.md for the fetch mechanism/provenance")
 
 
 # ---------------------------------------------------------------------------
 # Tab 6 — Resources (static from toppers_evidence.md)
 # ---------------------------------------------------------------------------
-def _render_resources() -> None:
+def _render_resources(study_log: list[dict] | None = None, today: date | None = None) -> None:
+    study_log = study_log or []
+    today = today or date.today()
     md = load_toppers_md()
     if md is None:
         _warn_missing(TOPPERS_FILE, "Toppers evidence report")
@@ -776,18 +1337,25 @@ def _render_resources() -> None:
 
     st.markdown("#### Convergent core-GS books (by independent topper count)")
     book_rows = [
-        {"Book": "M. Laxmikanth", "Named by": 9, "Subject": "Polity"},
-        {"Book": "NCERT VI–XII", "Named by": 8, "Subject": "Foundation"},
-        {"Book": "Spectrum / Rajiv Ahir", "Named by": 6, "Subject": "Modern History"},
-        {"Book": "G.C. Leong", "Named by": 2, "Subject": "Physical Geography"},
-        {"Book": "Shankar IAS", "Named by": 2, "Subject": "Environment"},
-        {"Book": "Ramesh Singh", "Named by": 1, "Subject": "Economy (WEAK — single source)"},
-        {"Book": "Lucent (Gen Science)", "Named by": 2, "Subject": "General Science"},
-        {"Book": "RS Sharma / Satish Chandra (old NCERT)", "Named by": 3, "Subject": "History"},
+        {"Book": "M. Laxmikanth", "Named by": 9, "Subject": "Polity", "English?": "Yes"},
+        {"Book": "NCERT VI–XII", "Named by": 8, "Subject": "Foundation", "English?": "Yes"},
+        {"Book": "Spectrum / Rajiv Ahir", "Named by": 6, "Subject": "Modern History", "English?": "Yes"},
+        {"Book": "RS Sharma / Satish Chandra (old NCERT)", "Named by": 3, "Subject": "History", "English?": "Yes"},
+        {"Book": "G.C. Leong", "Named by": 2, "Subject": "Physical Geography", "English?": "Yes"},
+        {"Book": "Shankar IAS", "Named by": 2, "Subject": "Environment", "English?": "Yes"},
+        {"Book": "Lucent (Gen Science)", "Named by": 2, "Subject": "General Science", "English?": "Yes"},
+        {"Book": "Ramesh Singh", "Named by": 1, "Subject": "Economy (WEAK — single source)", "English?": "Yes"},
+        {"Book": "Know Your State Jharkhand (Arihant, ISBN 9789378162992)", "Named by": 1,
+         "Subject": "Jharkhand state GK (WEAK — single confirmation, but strongest English "
+                    "state pick found)", "English?": "Yes — CONFIRMED"},
+        {"Book": "Samanya Hindi (Aaditya Publication)", "Named by": 1,
+         "Subject": "General Hindi paper (WEAK — the ONLY topper-cited Hindi-paper book found)",
+         "English?": "No — Hindi paper"},
     ]
     st.dataframe(pd.DataFrame(book_rows), use_container_width=True, hide_index=True)
     _tier_caption(TIER_WEAK, "convergent-count survivorship evidence — reports/toppers_evidence.md Part 2; "
-                              "single-named rows are WEAK, never required reading (Charter G4)")
+                              "single-named rows are WEAK, never required reading (Charter G4). Citation "
+                              "counts = distinct named toppers only, not a popularity poll.")
 
     st.markdown("#### State-specific English picks")
     st.markdown(
@@ -822,8 +1390,179 @@ def _render_resources() -> None:
     )
     _tier_caption(TIER_WEAK, "reports/toppers_evidence.md Part 6 — small named-sample prescriptive numbers")
 
+    st.divider()
+    _render_current_affairs_checklist(study_log, today)
+
+    st.divider()
+    _render_resource_links()
+
     with st.expander("Full toppers_evidence.md"):
         st.markdown(md)
+
+
+# ---------------------------------------------------------------------------
+# Current-affairs 12-month checklist (task #9)
+# ---------------------------------------------------------------------------
+CA_MONTHS = ["Dec-2025", "Jan-2026", "Feb-2026", "Mar-2026", "Apr-2026", "May-2026",
+             "Jun-2026", "Jul-2026", "Aug-2026", "Sep-2026", "Oct-2026", "Nov-2026"]
+
+
+def _render_current_affairs_checklist(study_log: list[dict], today: date) -> None:
+    st.markdown("#### 🗞️ Current-affairs coverage — 12-month grid (Dec-2025 → Nov-2026)")
+    st.caption(
+        "Prelims current-affairs share measured **13–30%** (CALCULATED from the paper corpus) "
+        "— a one-year window is the minimum; this grid runs Dec-2025 through Nov-2026 to cover "
+        "the full run-up to the 2026-12-06 UPPSC Prelims."
+    )
+    done_months = {r.get("topic") for r in study_log if r.get("type") == "current_affairs"}
+
+    cols = st.columns(4)
+    for i, month in enumerate(CA_MONTHS):
+        checked = month in done_months
+        new_val = cols[i % 4].checkbox(month, value=checked, key=f"ca_month_{month}")
+        if new_val and not checked:
+            entry = {"date": today.isoformat(), "exam": "UPPSC", "topic": month,
+                      "hours": 0, "type": "current_affairs", "note": "monthly CA coverage marked done"}
+            if append_study_log(entry):
+                st.rerun()
+        elif checked and not new_val:
+            st.caption(f"(un-checking {month} isn't persisted — logs are append-only; "
+                       "log a fresh entry if you genuinely need to redo this month)")
+    n_done = len(done_months & set(CA_MONTHS))
+    st.progress(n_done / len(CA_MONTHS), text=f"{n_done}/{len(CA_MONTHS)} months covered")
+    _tier_caption(TIER_CALCULATED, "13-30% range measured from data/processed backtest corpus "
+                                    "(topic_taxonomy_v2.json current-affairs tag share); persisted "
+                                    "as type='current_affairs' rows in exam_study_log, topic=month string")
+
+
+# ---------------------------------------------------------------------------
+# Resource links (task #10) — real, honest links only. No fabricated channel
+# URLs: topper-cited YouTube channels render as search-query links, never a
+# guessed /channel/ or /@handle URL, since none could be verified.
+# ---------------------------------------------------------------------------
+def _render_resource_links() -> None:
+    st.markdown("#### 🔗 Resource links")
+
+    st.markdown("**Official (verified URLs):**")
+    official_links = [
+        ("UPPSC advertisement / notifications", "https://uppsc.up.nic.in/"),
+        ("UPPSC previous question papers page",
+         "https://uppsc.up.nic.in/OuterPages/PreQuesPapers.aspx?ID=PrevQues"),
+        ("JPSC official site", "https://www.jpsc.gov.in/"),
+        ("BPSC official site", "https://bpsc.bihar.gov.in/"),
+        ("PRS Legislative Research — budget analysis", "https://prsindia.org/budgets"),
+    ]
+    for label, url in official_links:
+        st.markdown(f"- **OFFICIAL** [{label}]({url}) — `{url}`")
+    _tier_caption(TIER_OFFICIAL, "URLs verified directly against the commission/PRS domains")
+
+    st.markdown("**Topper-cited YouTube channels** (search links — exact channel URLs not "
+                "independently verified, so these deliberately point at a YouTube search, "
+                "never a guessed channel handle):")
+    yt_channels = [
+        ("Study for Civil Services", "Gyan Prakash Mishra — UP current affairs/budget",
+         "cited by Amit Gupta (UPPCS 2019+2020 selected)", "WEAK — single citation"),
+        ("UPAAM Abhyuday Cell UPPCS", "free e-content authored by serving SDMs",
+         "cited in toppers_evidence.md Part 2 (UP state-specific section)", "WEAK — single mention"),
+        ("ONLY IAS UPPCS", "general UPPCS prep channel", "referenced alongside UPAAM/Dhyeya in "
+         "the same evidence pass", "WEAK — not independently multi-sourced"),
+        ("Dhyeya IAS UPPCS", "general UPPCS prep channel", "referenced alongside UPAAM/ONLY IAS",
+         "WEAK — not independently multi-sourced"),
+        ("KR Studies", "BPSC geography/economy", "referenced in the BPSC resource pass",
+         "WEAK — single mention"),
+        ("SK Seth data interpretation", "BPSC data-interpretation/CSAT-style content",
+         "referenced in the BPSC resource pass", "WEAK — single mention"),
+    ]
+    for name, desc, who, tier in yt_channels:
+        q = name.replace(" ", "+")
+        st.markdown(
+            f"- [{name}](https://www.youtube.com/results?search_query={q}) — {desc}. "
+            f"**Who cited it:** {who}. **Evidence tier: {tier}**."
+        )
+    _tier_caption(TIER_WEAK, "reports/toppers_evidence.md — no channel URL is fabricated; every "
+                              "entry above is a live YouTube search link, not a claimed exact channel")
+
+    st.markdown("**Free PDFs (search links, not direct downloads — publishers change URLs often):**")
+    free_pdfs = [
+        ("Vision IAS Monthly Current Affairs (PDF)", "Vision+IAS+monthly+current+affairs+pdf"),
+        ("Bihar Economic Survey (Finance Dept, Govt of Bihar)", "Bihar+Economic+Survey+finance+department+pdf"),
+        ("Jharkhand Economic Survey", "Jharkhand+Economic+Survey+pdf"),
+    ]
+    for label, q in free_pdfs:
+        st.markdown(f"- [{label}](https://www.google.com/search?q={q}+filetype:pdf)")
+    _tier_caption(TIER_ESTIMATED, "search-query links, not verified direct PDF URLs — "
+                                   "publisher/government hosting paths change; verify freshness before relying on one")
+
+
+# ---------------------------------------------------------------------------
+# Mock schedule generator (task #8) — one full-length mock/week until the
+# final 5 weeks (2026-10-31), then 2-3/week; matched against logged mock
+# scores so each dated slot shows done/missed/upcoming.
+# ---------------------------------------------------------------------------
+MOCK_SCHEDULE_END = UPPSC_PRELIMS_DATE  # 2026-12-06
+MOCK_SCHEDULE_RAMP_DATE = date(2026, 10, 31)
+
+
+def generate_mock_schedule(start: date, end: date = MOCK_SCHEDULE_END,
+                            ramp_date: date = MOCK_SCHEDULE_RAMP_DATE) -> list[date]:
+    """One mock/week from `start` to `ramp_date`, then 2-3/week (alternating
+    2 and 3 to average ~2.5) from `ramp_date` to `end`. Siddharth Gupta
+    (UPPCS 2023 Rank 1) prescription — see toppers_evidence.md Part 6."""
+    dates = []
+    cursor = start
+    while cursor <= min(ramp_date, end):
+        dates.append(cursor)
+        cursor += timedelta(days=7)
+    # Final stretch: alternate 3-days-apart / 4-days-apart spacing so a week
+    # gets ~2-3 mocks (7 days / 2.5 ≈ every 2.8 days) without a rigid single
+    # cadence claiming false precision.
+    toggle = True
+    while cursor <= end:
+        dates.append(cursor)
+        cursor += timedelta(days=3 if toggle else 4)
+        toggle = not toggle
+    return dates
+
+
+def _render_mock_schedule_generator() -> None:
+    st.markdown("#### 🗓️ Mock schedule generator")
+    st.caption(
+        "One full-length mock/week from today to 2026-10-31, then 2-3/week into "
+        "the 2026-12-06 UPPSC Prelims. **Source: Siddharth Gupta (UPPCS 2023 "
+        "Rank 1) prescription** — toppers_evidence.md Part 6."
+    )
+    today = date.today()
+    scores = load_mock_scores()
+    logged_dates = {_parse_date(s.get("date")) for s in scores if _parse_date(s.get("date"))}
+
+    if not scores:
+        st.warning(
+            "🚨 **Sit UPPSC 2023 prelims COLD this week** — baseline before study "
+            "distorts it. The paper is in the **📄 Paper Library** tab."
+        )
+
+    schedule = generate_mock_schedule(today)
+    rows = []
+    for d in schedule:
+        # "done" if any mock is logged within ±3 days of the slot (a real slot
+        # isn't going to land on the exact calendar day every time).
+        hit = any(abs((d - ld).days) <= 3 for ld in logged_dates)
+        if hit:
+            status = "✅ done"
+        elif d < today:
+            status = "❌ missed"
+        else:
+            status = "⚪ upcoming"
+        rows.append({"Date": d.isoformat(), "Status": status})
+
+    sdf = pd.DataFrame(rows)
+    st.dataframe(sdf, use_container_width=True, hide_index=True, height=300)
+    n_done = sum(1 for r in rows if r["Status"] == "✅ done")
+    n_missed = sum(1 for r in rows if r["Status"] == "❌ missed")
+    st.caption(f"{n_done} done · {n_missed} missed · {len(rows) - n_done - n_missed} upcoming "
+               f"— matched against exam_mock_scores within a ±3 day window per slot.")
+    _tier_caption(TIER_WEAK, "cadence is Siddharth Gupta's single-topper prescription "
+                              "(toppers_evidence.md Part 6), not a cross-topper consensus")
 
 
 # ---------------------------------------------------------------------------
@@ -862,22 +1601,49 @@ def _render_charter() -> None:
     _tier_caption(TIER_OFFICIAL, "STRATEGY_CHARTER.md §5/§6/§7 — pre-registered 2026-07-29")
 
     st.divider()
+    _render_mock_schedule_generator()
+
+    st.divider()
     st.markdown("#### Mock-score tracker")
+    st.caption(
+        "Add topics you got wrong below — this feeds the Today tab's priority queue "
+        "(+1.5 per topic hit, last 60 days, capped at 3) so weak-spot topics surface "
+        "faster than plain staleness alone would put them."
+    )
+    topics = taxonomy_topics()
     with st.form("mock_score_form", clear_on_submit=True):
         c1, c2, c3, c4 = st.columns(4)
         m_date = c1.date_input("Date", value=date.today(), key="mock_date")
         m_exam = c2.selectbox("Exam", ["UPPSC", "BPSC", "JPSC"], key="mock_exam")
         m_score = c3.number_input("Score", min_value=0.0, step=0.5, key="mock_score")
         m_max = c4.number_input("Out of (max)", min_value=1.0, step=1.0, value=200.0, key="mock_max")
+        st.markdown("**Questions I got wrong, by topic:**")
+        wrong_topics = st.multiselect("Topics missed", topics if topics else [], key="mock_wrong_topics")
+        wrong_counts = {}
+        if wrong_topics:
+            wc_cols = st.columns(min(len(wrong_topics), 4))
+            for i, t in enumerate(wrong_topics):
+                wrong_counts[t] = wc_cols[i % len(wc_cols)].number_input(
+                    f"# wrong — {t[:20]}", min_value=1, max_value=50, value=1, step=1,
+                    key=f"mock_wrong_count_{t}")
         submitted = st.form_submit_button("Log mock score", use_container_width=True)
         if submitted:
             entry = {
                 "date": m_date.isoformat(), "exam": m_exam,
                 "score": m_score, "max": m_max,
-                "pct": round(100 * m_score / m_max, 1) if m_max else None,
             }
-            if append_mock_score(entry):
-                st.success(f"Logged {m_exam} {m_score}/{m_max:g} on {m_date.isoformat()}")
+            ok = append_mock_score(entry)
+            error_ok = True
+            for t, cnt in wrong_counts.items():
+                error_ok = append_error_log({
+                    "date": m_date.isoformat(), "exam": m_exam, "topic": t,
+                    "count": cnt, "note": "from mock-score form",
+                }) and error_ok
+            if ok:
+                msg = f"Logged {m_exam} {m_score}/{m_max:g} on {m_date.isoformat()}"
+                if wrong_counts:
+                    msg += f" + {len(wrong_counts)} error-log topic(s)"
+                st.success(msg)
                 st.rerun()
 
     scores = load_mock_scores()
@@ -899,4 +1665,4 @@ def _render_charter() -> None:
                        margin=dict(l=10, r=10, t=30, b=10))
     st.plotly_chart(fig, use_container_width=True)
     st.caption("55% line is **indicative only — UPPSC publishes no advance cutoff**.")
-    _tier_caption(TIER_CALCULATED, "strategy/mock_scores.json; 55% reference is ESTIMATED, not an official cutoff")
+    _tier_caption(TIER_CALCULATED, "exam_mock_scores DB table; 55% reference is ESTIMATED, not an official cutoff")

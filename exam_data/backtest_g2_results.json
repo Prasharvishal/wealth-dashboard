@@ -1,0 +1,155 @@
+[
+ {
+  "exam": "UPPSC",
+  "train_n": 576,
+  "train_years": [
+   "2018",
+   "2019",
+   "2020",
+   "2021"
+  ],
+  "years": {
+   "2023": {
+    "n": 142,
+    "strict_coverage_pct": 61.3,
+    "classified_coverage_pct": 73.7,
+    "unclassified_pct": 16.9,
+    "topic_share_kept_pct": 42.9,
+    "lift": 1.72,
+    "new_topics_not_in_train": []
+   },
+   "2025": {
+    "n": 215,
+    "strict_coverage_pct": 59.5,
+    "classified_coverage_pct": 82.6,
+    "unclassified_pct": 27.9,
+    "topic_share_kept_pct": 42.9,
+    "lift": 1.93,
+    "new_topics_not_in_train": []
+   }
+  },
+  "train_unclassified_pct": 12.5,
+  "topics_total": 28,
+  "topics_kept": 12,
+  "keep_list": [
+   "Reasoning",
+   "Environment and Ecology",
+   "Physical Geography",
+   "Constitution",
+   "National Current Affairs",
+   "General Science",
+   "Union and State Government",
+   "Uttar Pradesh Special",
+   "Modern History",
+   "Development and Planning",
+   "Numeracy",
+   "Art and Culture"
+  ],
+  "years_passing_strict": 0,
+  "verdict": "FAIL"
+ },
+ {
+  "exam": "BPSC",
+  "train_n": 318,
+  "train_years": [
+   "2020",
+   "2021",
+   "2022"
+  ],
+  "years": {
+   "2023": {
+    "n": 145,
+    "strict_coverage_pct": 64.8,
+    "classified_coverage_pct": 76.4,
+    "unclassified_pct": 15.2,
+    "topic_share_kept_pct": 48.1,
+    "lift": 1.59,
+    "new_topics_not_in_train": [
+     "Uttar Pradesh Special"
+    ]
+   },
+   "2025": {
+    "n": 71,
+    "strict_coverage_pct": 73.2,
+    "classified_coverage_pct": 81.2,
+    "unclassified_pct": 9.9,
+    "topic_share_kept_pct": 50.0,
+    "lift": 1.62,
+    "new_topics_not_in_train": []
+   }
+  },
+  "train_unclassified_pct": 10.7,
+  "topics_total": 26,
+  "topics_kept": 13,
+  "keep_list": [
+   "General Science",
+   "Modern History",
+   "National Current Affairs",
+   "Physical Geography",
+   "Union and State Government",
+   "Constitution",
+   "Numeracy",
+   "Ancient History",
+   "Technology",
+   "Bihar Special",
+   "Macroeconomy",
+   "International Current Affairs",
+   "Art and Culture"
+  ],
+  "years_passing_strict": 1,
+  "verdict": "FAIL"
+ },
+ {
+  "exam": "JPSC",
+  "train_n": 343,
+  "train_years": [
+   "2011",
+   "2016",
+   "2017"
+  ],
+  "years": {
+   "2023": {
+    "n": 220,
+    "strict_coverage_pct": 71.4,
+    "classified_coverage_pct": 78.1,
+    "unclassified_pct": 8.6,
+    "topic_share_kept_pct": 44.4,
+    "lift": 1.76,
+    "new_topics_not_in_train": [
+     "Bihar Special",
+     "Uttar Pradesh Special"
+    ]
+   },
+   "2025": {
+    "n": 209,
+    "strict_coverage_pct": 72.2,
+    "classified_coverage_pct": 80.3,
+    "unclassified_pct": 10.0,
+    "topic_share_kept_pct": 46.2,
+    "lift": 1.74,
+    "new_topics_not_in_train": [
+     "Uttar Pradesh Special"
+    ]
+   }
+  },
+  "train_unclassified_pct": 6.1,
+  "topics_total": 25,
+  "topics_kept": 12,
+  "keep_list": [
+   "Jharkhand Special",
+   "Physical Geography",
+   "National Current Affairs",
+   "Art and Culture",
+   "General Science",
+   "International Current Affairs",
+   "Constitution",
+   "Ancient History",
+   "Modern History",
+   "Public Administration",
+   "Environment and Ecology",
+   "Macroeconomy"
+  ],
+  "years_passing_strict": 2,
+  "verdict": "PASS"
+ }
+]
