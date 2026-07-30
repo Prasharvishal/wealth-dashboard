@@ -253,6 +253,175 @@ def _clean_option(val) -> str:
     return str(val).strip()
 
 
+# ---------------------------------------------------------------------------
+# Display-layer OCR-garbage cleanup (Question Bank tab only — never touches
+# the source CSVs). Bilingual PSC papers OCR as: [real English question] +
+# [garbled Hindi-half tail rendered as Latin-looking noise], sometimes with a
+# second question's block merged in. Three passes, in order:
+#   1. _first_option_block  — cut off a second "(a)...(d)" block (Hindi
+#      repeat, or a merged next question) before anything else runs.
+#   2. _split_stem_options   — regex-parse the first "(a)...(d)" block into
+#      (stem, [options]) so they can be cleaned + rendered independently.
+#   3. _strip_garbage        — token-level filter, applied to the stem and
+#      each option separately (never to the whole blob at once, so garbage
+#      trailing one option can't contaminate the next).
+# ---------------------------------------------------------------------------
+
+_GARBAGE_CHARS_RE = re.compile(r"[€¥®{}\[\]|@*`]")
+_LIGATURE_JUNK_RE = re.compile(r"ff[il]{1,2}", re.IGNORECASE)
+_VOWEL_RE = re.compile(r"[aeiouAEIOU]")
+_PUNCT_RUN_RE = re.compile(r"^[:\-_.]{3,}$")
+_LONE_OPTION_MARKER_RE = re.compile(r"^[\(\[]\s*[a-dA-D1-4]\s*[\)\].:]?$")
+
+# Legit digit+alpha tokens to always preserve: plain years ("1947"), ordinals
+# ("91st", "42nd"), and hyphenated alphanum like "COVID-19" / "Article-356".
+_ORDINAL_RE = re.compile(r"^\d+(st|nd|rd|th)$", re.IGNORECASE)
+_YEAR_RE = re.compile(r"^\d{3,4}$")
+_ALPHANUM_WORD_RE = re.compile(r"^[A-Za-z]+-?\d+$")
+
+
+def _is_garbage_token(tok: str) -> bool:
+    """Conservative per-token junk test — when unsure, keep the token (task
+    spec). Only fires on strong, specific signals of OCR-noise, never on
+    plain unusual-looking real words."""
+    if not tok:
+        return False
+    alpha_only = "".join(c for c in tok if c.isalpha())
+    has_vowel = bool(_VOWEL_RE.search(alpha_only))
+
+    if _GARBAGE_CHARS_RE.search(tok):
+        return True
+    if _PUNCT_RUN_RE.match(tok):
+        return True
+
+    colon_count = tok.count(":")
+    # Token dominated by colon punctuation with little/no real alpha content,
+    # e.g. "A::::::::" or "{:i" or "{:}" (OCR box/table-line noise).
+    if colon_count >= 3 and colon_count >= len(alpha_only):
+        return True
+    # Colons gluing together alpha chunks where any chunk itself has zero
+    # vowels, e.g. "::tnhd::eenndd:eenntt" -> chunks "tnhd"/"eenndd"/"eenntt";
+    # "tnhd" has no vowel at all — real words glued by stray colons don't
+    # happen; this is OCR table-line noise bleeding into the token stream.
+    if colon_count >= 2:
+        chunks = [p for p in tok.split(":") if p]
+        if len(chunks) >= 2 and any(
+            len(c) >= 3 and c.isalpha() and not _VOWEL_RE.search(c) for c in chunks
+        ):
+            return True
+
+    # ffi/ffl ligature runs embedded in otherwise non-word junk (no vowel
+    # elsewhere in the token) — legitimate words containing "ffi"/"ffl"
+    # ("office", "affluent") always carry vowels around them, so this only
+    # fires on the vowel-less garbage case.
+    if _LIGATURE_JUNK_RE.search(tok) and not has_vowel:
+        return True
+    # Length>=5 alpha token with zero vowels — no real English word does this.
+    if len(alpha_only) >= 5 and alpha_only.isalpha() and not has_vowel:
+        return True
+
+    # Digit+alpha mixed junk, e.g. "3FTTapqtr", "42iFT+rfu", "52FT.dwh" — but
+    # preserve legit patterns first: pure years, ordinals, "COVID-19"-style,
+    # and plain all-alpha or all-digit tokens.
+    if _YEAR_RE.match(tok) or _ORDINAL_RE.match(tok):
+        return False
+    if tok.isalpha() or tok.isdigit():
+        return False
+    if _ALPHANUM_WORD_RE.match(tok):
+        return False
+    has_digit = any(c.isdigit() for c in tok)
+    has_alpha = any(c.isalpha() for c in tok)
+    if has_digit and has_alpha:
+        stripped = tok.strip(".,;:")
+        if _YEAR_RE.match(stripped) or _ORDINAL_RE.match(stripped) or _ALPHANUM_WORD_RE.match(stripped):
+            return False
+        return True
+    return False
+
+
+def _strip_garbage(text: str) -> str:
+    """Token-level cleaner — drop OCR-garbage tokens, collapse whitespace.
+    Conservative: only drops tokens _is_garbage_token flags; everything else
+    (including odd-looking but plausible real words) is kept."""
+    if not text:
+        return text
+    kept = []
+    for tok in text.split():
+        if _is_garbage_token(tok):
+            continue
+        if _LONE_OPTION_MARKER_RE.match(tok):
+            continue
+        kept.append(tok)
+    return re.sub(r"\s+", " ", " ".join(kept)).strip()
+
+
+_FIRST_OPTION_A_RE = re.compile(r"\(\s*[aA1i]\s*\)")
+
+
+def _first_option_block(text: str) -> str:
+    """If the text contains two or more '(a)...' sequences, truncate
+    everything from the SECOND '(a)' onward — the Hindi repeat of the same
+    question, or a merged-in next question. Must run BEFORE garbage
+    stripping (stripping first could delete a marker and hide the merge)."""
+    if not text:
+        return text
+    matches = list(_FIRST_OPTION_A_RE.finditer(text))
+    if len(matches) >= 2:
+        return text[:matches[1].start()].strip()
+    return text
+
+
+_STEM_OPTIONS_RE = re.compile(
+    r"^(?P<stem>.*?)"
+    r"[\(\[]\s*(?:a|A|1|i)\s*[\)\].:]\s*(?P<a>.*?)"
+    r"[\(\[]\s*(?:b|B|2|ii)\s*[\)\].:]\s*(?P<b>.*?)"
+    r"(?:[\(\[]\s*(?:c|C|3|iii)\s*[\)\].:]\s*(?P<c>.*?))?"
+    r"(?:[\(\[]\s*(?:d|D|4|iv)\s*[\)\].:]\s*(?P<d>.*?))?"
+    r"$",
+    re.IGNORECASE | re.DOTALL,
+)
+_WORDLIKE_RE = re.compile(r"[A-Za-z]{2,}")
+
+
+def _split_stem_options(text: str) -> tuple[str, list[str]]:
+    """Regex-parse the first '(a) X (b) Y (c) Z (d) W' block into
+    (stem, [options]); tolerates (A)/(1)/(i) variants. Returns ([], "") — i.e.
+    (text, []) — unchanged if parsing doesn't yield >=2 usable options."""
+    if not text:
+        return text, []
+    m = _STEM_OPTIONS_RE.match(text)
+    if not m:
+        return text, []
+    stem = (m.group("stem") or "").strip()
+    opts = [m.group(k).strip() for k in ("a", "b", "c", "d") if m.group(k) and m.group(k).strip()]
+    good = [o for o in opts if _WORDLIKE_RE.search(o)]
+    if len(good) >= 2 and stem:
+        return stem, opts
+    return text, []
+
+
+def clean_question_display(raw_text: str) -> tuple[str, list[str]]:
+    """Full pipeline for one question_text blob -> (clean_stem, clean_options).
+    clean_options is [] when structured parsing wasn't possible/reliable —
+    callers should render clean_stem as the whole cleaned text in that case.
+    Order (task spec): _first_option_block -> _split_stem_options ->
+    _strip_garbage (stem and each option separately) -> re-check options
+    survived cleaning with real wordlike content (garbage-only options, e.g.
+    unrecoverable Hindi-OCR answer choices, must fall back to plain text
+    rather than render as empty/junk option rows)."""
+    if not raw_text:
+        return "", []
+    truncated = _first_option_block(raw_text)
+    stem, opts = _split_stem_options(truncated)
+    if opts:
+        clean_stem = _strip_garbage(stem)
+        clean_opts = [_strip_garbage(o) for o in opts]
+        good = [o for o in clean_opts if _WORDLIKE_RE.search(o)]
+        if len(good) >= 2:
+            return clean_stem, clean_opts
+    return _strip_garbage(truncated), []
+
+
 @st.cache_data(show_spinner=False)
 def load_question_bank() -> pd.DataFrame:
     """Union of repaired (has topic) + recovered (has options, needs classify)."""
@@ -1001,19 +1170,7 @@ def _render_question_bank(prefilter_topic: str | None = None) -> None:
     _tier_caption(TIER_CALCULATED, "question_bank_repaired.csv + question_bank_recovered.csv; "
                                     "recovered-file topics auto-classified on the fly with taxonomy v2")
 
-    n_low_quality = int(df["_low_quality"].sum())
     n_hindi_paper = int(df["_hindi_paper"].sum())
-    qc1, qc2 = st.columns(2)
-    show_low_quality = qc1.checkbox(
-        f"show low-quality OCR rows ({n_low_quality:,} hidden)", value=False, key="qb_show_low_quality")
-    show_hindi_papers = qc2.checkbox(
-        f"include Hindi-paper rows ({n_hindi_paper:,} hidden)", value=False, key="qb_show_hindi")
-    st.caption(
-        "Default view hides rows whose OCR text contains fewer than 3 distinct common English "
-        "words (garbled Devanagari-as-Latin OCR noise, e.g. \"qTma ap ffi-ffitr3 q5q dr alis\") "
-        "and rows from papers matching hindi/language/literature/essay (inherently Hindi-content, "
-        "so their OCR is real Hindi text mis-rendered, not fixable by the English-word check)."
-    )
 
     fc1, fc2, fc3, fc4 = st.columns(4)
     exam_opts = ["(all)"] + sorted(x for x in df["exam"].unique() if x)
@@ -1031,9 +1188,11 @@ def _render_question_bank(prefilter_topic: str | None = None) -> None:
     topic_f = fc4.selectbox("Topic", topic_opts, key="qb_topic")
     search = st.text_input("Text search", key="qb_search")
 
+    qc1, qc2 = st.columns(2)
+    show_hindi_papers = qc2.checkbox(
+        f"include Hindi-paper rows ({n_hindi_paper:,} hidden)", value=False, key="qb_show_hindi")
+
     filtered = df
-    if not show_low_quality:
-        filtered = filtered[~filtered["_low_quality"]]
     if not show_hindi_papers:
         filtered = filtered[~filtered["_hindi_paper"]]
     if exam_f != "(all)":
@@ -1048,30 +1207,69 @@ def _render_question_bank(prefilter_topic: str | None = None) -> None:
         filtered = filtered[filtered["question_text"].str.contains(
             re.escape(search.strip()), case=False, na=False)]
 
-    st.write(f"**{len(filtered):,}** questions match.")
+    # Clean each remaining row's display text BEFORE the low-quality hide/show
+    # decision — a row whose raw OCR looked garbled but whose cleaned stem is
+    # now legible English should show even with "show low-quality" unchecked
+    # (task requirement: re-apply is_english_like AFTER cleaning).
+    cleaned_rows = []
+    for _, row in filtered.iterrows():
+        raw_text = row.get("question_text", "") or ""
+        clean_stem, parsed_opts = clean_question_display(raw_text)
+        csv_opts = [_strip_garbage(_clean_option(row.get(c, "")))
+                    for c in ("option_a", "option_b", "option_c", "option_d")]
+        non_empty_csv_opts = [o for o in csv_opts if o]
+        # Prefer real CSV option columns when they survive cleaning; else
+        # fall back to the options parsed out of the stem text itself.
+        if len(non_empty_csv_opts) >= 2:
+            display_opts = csv_opts
+        elif len(parsed_opts) >= 2:
+            display_opts = parsed_opts
+        else:
+            display_opts = []
+        is_clean_english = is_english_like(clean_stem)
+        cleaned_rows.append({
+            "row": row,
+            "clean_stem": clean_stem,
+            "display_opts": display_opts,
+            "is_low_quality": not is_clean_english,
+        })
+
+    n_low_quality_after_clean = sum(1 for r in cleaned_rows if r["is_low_quality"])
+    show_low_quality = qc1.checkbox(
+        f"show low-quality OCR rows ({n_low_quality_after_clean:,} hidden)",
+        value=False, key="qb_show_low_quality")
+    st.caption(
+        "Default view hides rows whose CLEANED stem still contains fewer than 3 distinct common "
+        "English words (garbled Devanagari-as-Latin OCR noise, e.g. \"qTma ap ffi-ffitr3 q5q dr alis\", "
+        "survives even after garbage-token stripping) and rows from papers matching "
+        "hindi/language/literature/essay (inherently Hindi-content, so their OCR is real Hindi text "
+        "mis-rendered, not fixable by the English-word check)."
+    )
+    if not show_low_quality:
+        cleaned_rows = [r for r in cleaned_rows if not r["is_low_quality"]]
+
+    st.write(f"**{len(cleaned_rows):,}** questions match.")
 
     page_size = 20
-    n_pages = max(1, (len(filtered) + page_size - 1) // page_size)
+    n_pages = max(1, (len(cleaned_rows) + page_size - 1) // page_size)
     page = st.number_input("Page", min_value=1, max_value=n_pages, value=1, step=1)
     start = (page - 1) * page_size
-    page_df = filtered.iloc[start:start + page_size]
+    page_rows = cleaned_rows[start:start + page_size]
 
-    has_options_col = "option_a" in page_df.columns
-
-    for _, row in page_df.iterrows():
+    for item in page_rows:
+        row = item["row"]
         header = f"{row.get('exam','?')} {row.get('year','?')} · {row.get('stage','?')} · {row.get('topic','UNCLASSIFIED')}"
         with st.container(border=True):
             st.markdown(f"**{header}**")
-            st.write(row.get("question_text", ""))
-            opts = [_clean_option(row.get(c, "")) for c in ("option_a", "option_b", "option_c", "option_d")]
-            non_empty_opts = [o for o in opts if o]
+            st.write(item["clean_stem"])
+            display_opts = item["display_opts"]
             # Practice mode only when there's something real to reveal — a
-            # row with 0-1 non-empty options (post-nan-cleanup) gets no
-            # expander rather than an empty/near-empty one (task fix #2).
-            if has_options_col and len(non_empty_opts) >= 2:
+            # row with <2 usable options gets no expander rather than an
+            # empty/near-empty one (task fix #2, preserved).
+            if len(display_opts) >= 2:
                 with st.expander("Practice mode — reveal options"):
                     labels = ["a", "b", "c", "d"]
-                    for lbl, opt in zip(labels, opts):
+                    for lbl, opt in zip(labels, display_opts):
                         if opt:
                             st.write(f"**{lbl})** {opt}")
     st.caption(f"Page {page} of {n_pages} · {page_size}/page")
