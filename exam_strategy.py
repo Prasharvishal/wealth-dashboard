@@ -130,6 +130,15 @@ TIER_OFFICIAL = "OFFICIAL"
 TIER_ESTIMATED = "ESTIMATED"
 TIER_WEAK = "WEAK"
 TIER_UNKNOWN = "UNKNOWN"
+TIER_CONVERGENT = "CONVERGENT"
+TIER_LITERATURE = "LITERATURE-BACKED"
+TIER_FREQUENCY = "FREQUENCY-COUNTED"
+
+# Minimum topic-level sample size before a rising/stable/declining trend claim
+# is allowed (RUNBOOK/STRATEGY_CHARTER research-doctrine G1 analogue, ported to
+# the exam-prep domain per this task's spec: "suppress trend claims when topic
+# n<30").
+_TREND_MIN_N = 30
 
 
 def _tier_caption(tier: str, note: str = "") -> None:
@@ -915,9 +924,9 @@ def render() -> None:
     _qbank_prefilter = st.session_state.pop("_qbank_prefilter_topic", None)
 
     (tab_today, tab_priorities, tab_qbank, tab_calc,
-     tab_revision, tab_papers, tab_resources, tab_charter) = st.tabs([
+     tab_revision, tab_papers, tab_ask, tab_method, tab_resources, tab_charter) = st.tabs([
         "📌 Today", "🎯 Priorities", "📝 Question Bank", "🧮 Attack Calculator",
-        "🔁 Revision", "📄 Paper Library", "📚 Resources", "🧭 Charter",
+        "🔁 Revision", "📄 Paper Library", "🔎 Ask", "📖 Method", "📚 Resources", "🧭 Charter",
     ])
 
     with tab_today:
@@ -932,6 +941,10 @@ def render() -> None:
         _render_revision(study_log, today)
     with tab_papers:
         _render_paper_library()
+    with tab_ask:
+        _render_ask()
+    with tab_method:
+        _render_method()
     with tab_resources:
         _render_resources(study_log, today)
     with tab_charter:
@@ -1538,6 +1551,526 @@ def _render_paper_library() -> None:
                 cc2.caption(f"unreadable: {exc}")
     _tier_caption(TIER_OFFICIAL, "data/raw/pdfs/ harvested from official commission sites — "
                                   "see reports/uppsc_harvest_report.md for the fetch mechanism/provenance")
+
+
+# ---------------------------------------------------------------------------
+# Tab "Ask" — instant data answers, no LLM. Three sections: Topic Explorer,
+# Concept Search, Quick Router. Read-only over the same on-disk corpora the
+# rest of the app uses (question bank CSVs, backtest_g2_results.json, taxonomy
+# v2) — nothing here writes to the DB or any file.
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def _topic_year_counts(exam: str, topic: str) -> dict:
+    """{year(str): count} for one (exam, topic) pair, classifying on the fly
+    with the existing stem_pattern/classify pipeline (task spec) rather than
+    trusting only the bank-labelled `topic` column — a question bank-labelled
+    "" topic that would in fact classify to this topic still counts."""
+    df = load_question_bank()
+    if df.empty:
+        return {}
+    sub = df[df["exam"].str.upper() == exam.upper()].copy()
+    if sub.empty:
+        return {}
+    rules = build_classifier_rules()
+    text_col = sub["question_text"] if "question_text" in sub.columns else pd.Series([""] * len(sub))
+    # Reuse the bank-labelled topic where present (bank-labelled rows are
+    # already the ground truth for `repaired`), else classify on the fly —
+    # mirrors load_question_bank()'s own needs_classify logic exactly, just
+    # scoped to this one topic so the whole bank isn't reclassified again here
+    # (build_classifier_rules/classify_text are cheap, but this keeps parity).
+    has_topic = sub["topic"].fillna("").str.strip().ne("")
+    computed_topic = sub["topic"].copy()
+    if (~has_topic).any():
+        computed_topic.loc[~has_topic] = text_col[~has_topic].apply(lambda t: classify_text(t, rules))
+    match = computed_topic == topic
+    years = sub.loc[match, "year"].fillna("").astype(str)
+    years = years[years.str.strip() != ""]
+    return years.value_counts().to_dict()
+
+
+def _trend_caption(year_counts: dict) -> str:
+    """rising/stable/declining from first-half vs second-half years, with n,
+    suppressed under _TREND_MIN_N per research-doctrine G1 (small samples are
+    informational only, never trend-deciding)."""
+    n_total = sum(year_counts.values())
+    if n_total < _TREND_MIN_N:
+        return f"Sample too small for a trend claim (n={n_total} < {_TREND_MIN_N})."
+    years_sorted = sorted(year_counts.keys())
+    half = max(1, len(years_sorted) // 2)
+    first_years, second_years = years_sorted[:half], years_sorted[half:]
+    n_first = sum(year_counts[y] for y in first_years)
+    n_second = sum(year_counts[y] for y in second_years)
+    if n_first == 0 and n_second == 0:
+        return f"Sample too small for a trend claim (n={n_total})."
+    ratio = (n_second - n_first) / max(1, n_first)
+    if ratio > 0.25:
+        direction = "RISING"
+    elif ratio < -0.25:
+        direction = "DECLINING"
+    else:
+        direction = "STABLE"
+    return (f"Trend: **{direction}** — first half ({', '.join(first_years) or '—'}) "
+            f"n={n_first}, second half ({', '.join(second_years) or '—'}) n={n_second}; "
+            f"total n={n_total}.")
+
+
+@st.cache_data(show_spinner=False)
+def _lowercase_corpus() -> pd.DataFrame:
+    """Cleaned + lowercased question_text corpus, cached once for fast repeat
+    searches. Cleaning reuses clean_question_display (task spec: search over
+    CLEANED text, not raw OCR blobs)."""
+    df = load_question_bank()
+    if df.empty:
+        return df
+    df = df.copy()
+    clean_pairs = df["question_text"].fillna("").apply(clean_question_display)
+    df["_clean_stem"] = clean_pairs.apply(lambda p: p[0])
+    df["_clean_opts"] = clean_pairs.apply(lambda p: p[1])
+    df["_search_text"] = df["_clean_stem"].str.lower()
+    return df
+
+
+def _word_boundary_search(corpus: pd.DataFrame, query: str) -> pd.DataFrame:
+    q = query.strip()
+    if not q or corpus.empty:
+        return corpus.iloc[0:0]
+    pattern = r"\b" + re.escape(q.lower()) + r"\b"
+    mask = corpus["_search_text"].str.contains(pattern, regex=True, na=False)
+    return corpus[mask]
+
+
+# Quick Router keyword patterns (task spec) — no LLM, pure regex routing.
+# "recur" pattern covers both phrasings: "repeat/recur/asked before <X>" (X
+# trails the keyword) and "has <X> been asked before / <X> repeated" (X leads
+# the keyword) — the leading-fragment alternative is tried second in
+# _render_quick_router so the trailing-fragment case (the task's own example,
+# "repeat of Ramsar") is preferred when both could match.
+_ROUTE_WEIGHTAGE_RE = re.compile(r"\b(?:weightage|focus|priority)\s+(?:of|for)\s+(.+)", re.IGNORECASE)
+_ROUTE_RECUR_TRAIL_RE = re.compile(
+    r"\b(?:repeat|recur[a-z]*|asked before)\b\s*(?:of|for|on)?\s*(.+)", re.IGNORECASE)
+_ROUTE_RECUR_LEAD_RE = re.compile(
+    r"^(?:has|have|is|does)?\s*(.+?)\s+\b(?:repeat(?:ed)?|recurr?(?:ed|ing)?|"
+    r"asked before|been asked before)\b", re.IGNORECASE)
+_ROUTE_TREND_RE = re.compile(r"\btrend\s+(?:of|for|in)\s+(.+)", re.IGNORECASE)
+_ROUTE_SOURCE_RE = re.compile(r"\b(?:books?|sources?)\s+for\s+(.+)", re.IGNORECASE)
+
+
+def _fuzzy_topic_match(fragment: str, topics: list[str]) -> str | None:
+    """Substring match (task spec: "fuzzy" = substring) on taxonomy topic
+    list, case-insensitive. Prefers the shortest topic name containing the
+    fragment (most specific), then falls back to a fragment-contains-topic
+    check for short queries like 'polity'."""
+    frag = fragment.strip().lower().rstrip("?.! ")
+    frag = re.sub(r"^(?:of|for|on|about)\s+", "", frag).strip()
+    if not frag:
+        return None
+    contains = [t for t in topics if frag in t.lower()]
+    if contains:
+        return min(contains, key=len)
+    contained_by = [t for t in topics if t.lower() in frag]
+    if contained_by:
+        return max(contained_by, key=len)
+    # word-level overlap fallback — e.g. "environment ecology" vs topic
+    # "Environment & Ecology"
+    frag_words = set(re.findall(r"[a-z]+", frag))
+    best, best_score = None, 0
+    for t in topics:
+        t_words = set(re.findall(r"[a-z]+", t.lower()))
+        score = len(frag_words & t_words)
+        if score > best_score:
+            best, best_score = t, score
+    return best
+
+
+def _render_ask() -> None:
+    st.markdown("### 🔎 Ask — instant data answers")
+    st.caption(
+        "Everything on this tab is computed locally from the on-disk question bank, "
+        "the G2 backtest keep-lists, and taxonomy v2 — no LLM calls, no network. "
+        "For strategy judgement (should I sacrifice this topic, is this book worth it), "
+        "ask Claude in session — this tab only ever reports what the data says."
+    )
+
+    sub_explorer, sub_search, sub_router = st.tabs(
+        ["Topic Explorer", "Concept Search", "Quick Router"])
+
+    with sub_explorer:
+        _render_topic_explorer()
+    with sub_search:
+        _render_concept_search()
+    with sub_router:
+        _render_quick_router()
+
+
+# ---- Ask § 1: Topic Explorer ----------------------------------------------
+def _render_topic_explorer(preselect_exam: str | None = None,
+                            preselect_topic: str | None = None) -> None:
+    st.markdown("#### Topic Explorer")
+    topics = taxonomy_topics()
+    if not topics:
+        _warn_missing(TAXONOMY_FILE, "Topic taxonomy v2")
+        return
+
+    exam_options = ["UPSC", "UPPSC", "BPSC", "JPSC"]
+    c1, c2 = st.columns(2)
+    exam_idx = exam_options.index(preselect_exam) if preselect_exam in exam_options else 0
+    exam = c1.selectbox("Exam", exam_options, index=exam_idx, key="explorer_exam")
+    topic_idx = topics.index(preselect_topic) if preselect_topic in topics else 0
+    topic = c2.selectbox("Topic", topics, index=topic_idx, key="explorer_topic")
+
+    year_counts = _topic_year_counts(exam, topic)
+    n_total = sum(year_counts.values())
+
+    # (a) bar chart of question count per year
+    if year_counts:
+        chart_df = pd.DataFrame(
+            sorted(year_counts.items()), columns=["Year", "Questions"]
+        ).set_index("Year")
+        st.bar_chart(chart_df)
+    else:
+        st.info(f"No questions classified to **{topic}** for {exam} in the loaded bank.")
+    _tier_caption(TIER_CALCULATED,
+                  "question_bank_{repaired,recovered,upsc}.csv, classified on the fly "
+                  "with taxonomy v2 stem-pattern rules (build_classifier_rules/classify_text)")
+
+    # (b) emphasis tier + G2 coverage evidence line
+    tiers = emphasis_tier_map(exam)
+    tier = tiers.get(topic, "ONE-PASS")
+    results = load_backtest_results()
+    rec = next((r for r in results if r.get("exam", "").upper() == exam.upper()), None)
+    tier_emoji = {"DEEP": "🔴", "STANDARD": "🟡", "ONE-PASS": "⚪"}.get(tier, "⚪")
+    st.markdown(f"**Emphasis tier: {tier_emoji} {tier}**")
+    if rec:
+        years_covered = ", ".join(sorted(rec.get("years", {}).keys()))
+        st.caption(
+            f"G2 keep-list evidence — {exam}: {rec.get('topics_kept', '?')}/"
+            f"{rec.get('topics_total', '?')} topics kept; held-out years [{years_covered}] "
+            f"validate the keep-list (see Priorities tab for full per-year coverage)."
+        )
+    else:
+        st.caption(f"No G2 backtest record for {exam} — tier defaults to ONE-PASS.")
+    _tier_caption(TIER_CALCULATED, "exam_data/backtest_g2_results.json keep_list / years")
+
+    # (c) trend caption, first-half vs second-half years, n-gated
+    st.markdown(f"**{_trend_caption(year_counts)}**")
+    _tier_caption(TIER_WEAK if n_total < _TREND_MIN_N else TIER_CALCULATED,
+                  f"n={n_total} questions classified to {topic} for {exam}; "
+                  f"gate = {_TREND_MIN_N} per research-doctrine G1 (sub-sample-size "
+                  f"trend claims are never gate-deciding)")
+
+    # (d) expander with that topic's questions, cleaned
+    with st.expander(f"Show {n_total} question(s) for {topic} · {exam}"):
+        df = load_question_bank()
+        if not df.empty:
+            rules = build_classifier_rules()
+            sub = df[df["exam"].str.upper() == exam.upper()].copy()
+            text_col = sub["question_text"] if "question_text" in sub.columns else pd.Series([""] * len(sub))
+            has_topic = sub["topic"].fillna("").str.strip().ne("")
+            computed_topic = sub["topic"].copy()
+            if (~has_topic).any():
+                computed_topic.loc[~has_topic] = text_col[~has_topic].apply(lambda t: classify_text(t, rules))
+            match_rows = sub[computed_topic == topic]
+            if match_rows.empty:
+                st.caption("Nothing to show.")
+            for _, row in match_rows.iterrows():
+                clean_stem, _opts = clean_question_display(row.get("question_text", "") or "")
+                if not clean_stem:
+                    continue
+                st.markdown(f"**{row.get('exam','?')} {row.get('year','?')} · {row.get('stage','?')}**")
+                st.write(clean_stem)
+                st.divider()
+
+
+# ---- Ask § 2: Concept Search -----------------------------------------------
+def _render_concept_search(prefill: str | None = None) -> None:
+    st.markdown("#### Concept Search")
+    st.caption(
+        "Case-insensitive, word-boundary search over the CLEANED question text "
+        "across all exams/years (repaired + recovered + upsc)."
+    )
+    query = st.text_input("Search term", value=prefill or "", key="concept_search_query")
+    if not query.strip():
+        st.caption("Type a term (e.g. \"Ramsar\", \"GST\", \"Article 370\") to search.")
+        return
+
+    corpus = _lowercase_corpus()
+    if corpus.empty:
+        _warn_missing(QBANK_REPAIRED, "Question bank")
+        return
+
+    hits = _word_boundary_search(corpus, query)
+    n_hits = len(hits)
+    st.markdown(f"**{n_hits}** total hit(s) for \"{query.strip()}\".")
+
+    if n_hits == 0:
+        _tier_caption(TIER_CALCULATED, "question_bank_{repaired,recovered,upsc}.csv — cleaned corpus")
+        return
+
+    n_years = hits["year"].fillna("").astype(str).str.strip().replace("", pd.NA).nunique()
+    if n_years >= 3:
+        st.success(f"🏅 **RECURRING CONCEPT — flashcard core** (appears in {n_years} distinct years)")
+
+    # per-year x per-exam count table
+    pivot = (
+        hits.assign(year=hits["year"].fillna("").astype(str))
+        .groupby(["year", "exam"]).size()
+        .unstack(fill_value=0)
+        .sort_index()
+    )
+    st.markdown("**Per-year x per-exam hit count:**")
+    st.dataframe(pivot, use_container_width=True)
+    _tier_caption(TIER_CALCULATED, "question_bank_{repaired,recovered,upsc}.csv — cleaned corpus, "
+                                    "word-boundary regex match")
+
+    st.markdown("**Matching questions:**")
+    page_size = 15
+    n_pages = max(1, (n_hits + page_size - 1) // page_size)
+    page = st.number_input("Page", min_value=1, max_value=n_pages, value=1, step=1,
+                            key="concept_search_page")
+    start = (page - 1) * page_size
+    page_rows = hits.iloc[start:start + page_size]
+    for _, row in page_rows.iterrows():
+        header = f"{row.get('exam','?')} {row.get('year','?')} · {row.get('stage','?')} · {row.get('topic') or 'UNCLASSIFIED'}"
+        with st.container(border=True):
+            st.markdown(f"**{header}**")
+            st.write(row.get("_clean_stem", ""))
+    st.caption(f"Page {page} of {n_pages} · {page_size}/page")
+
+
+# ---- Ask § 3: Quick Router --------------------------------------------------
+def _render_quick_router() -> None:
+    st.markdown("#### Quick Router")
+    st.caption(
+        "Keyword-pattern routing only — no LLM, no fabricated answers. "
+        "Try: \"weightage of Polity\", \"repeat of Ramsar\", \"trend of Environment\", "
+        "\"books for Geography\"."
+    )
+    query = st.text_input("Ask about the data...", key="router_query")
+    if not query.strip():
+        return
+
+    topics = taxonomy_topics()
+    q = query.strip()
+
+    m = _ROUTE_WEIGHTAGE_RE.search(q) or _ROUTE_TREND_RE.search(q)
+    if m:
+        fragment = m.group(1)
+        topic = _fuzzy_topic_match(fragment, topics)
+        if topic:
+            st.success(f"Routed to **Topic Explorer** — preselected **{topic}**.")
+            _render_topic_explorer(preselect_topic=topic)
+            return
+        st.warning(f"Couldn't match \"{fragment.strip()}\" to a taxonomy topic. "
+                   "Data answers: weightage/trends/recurrence/PYQs. For strategy "
+                   "judgement, ask Claude in session.")
+        return
+
+    # Recur/repeat pattern: try "repeat/recur/asked before <X>" first (the
+    # task's own worked example), then "<X> repeated/recurred/asked before"
+    # so both phrasings route correctly.
+    m = _ROUTE_RECUR_TRAIL_RE.search(q) or _ROUTE_RECUR_LEAD_RE.search(q)
+    if m:
+        fragment = re.sub(r"^(?:of|for|on|about)\s+", "", m.group(1).strip(), flags=re.IGNORECASE).strip()
+        if fragment:
+            st.success(f"Routed to **Concept Search** — prefilled \"{fragment}\".")
+            _render_concept_search(prefill=fragment)
+            return
+
+    m = _ROUTE_SOURCE_RE.search(q)
+    if m:
+        fragment = m.group(1)
+        topic = _fuzzy_topic_match(fragment, topics)
+        st.info(
+            f"Book/source recommendations live on the **📚 Resources** tab"
+            + (f" — look for **{topic}**." if topic else ".")
+        )
+        return
+
+    st.warning(
+        "Data answers: weightage/trends/recurrence/PYQs. For strategy judgement, "
+        "ask Claude in session."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tab "Method" — static study-protocol reference. Content bundled as Python
+# data/markdown strings (task spec: not file reads, so cloud mode works too),
+# sourced from STUDY_PROTOCOL.md and cse_toppers_methods.md (2026-07-31,
+# /Users/vishal/Documents/New project/reports/) at the time this tab was
+# written. If those source docs are revised later, this tab will NOT
+# auto-update — it's a frozen bundle by design (task spec + cloud portability).
+# ---------------------------------------------------------------------------
+_CHAPTER_PROTOCOL_STEPS = [
+    ("0. PRE-TEST", "10 min", "Cold, closed-book: open Question Bank -> filter topic -> "
+     "attempt 8-10 PYQs before reading anything. Primes encoding of the coming material "
+     "(Kornell et al. 2009). Note what you missed — those are your reading targets."),
+    ("1. ACTIVE READ", "40-50 min", "Read the chapter once. NO highlighter. Convert each "
+     "section heading into a question before reading it, then read to answer it. "
+     "Mark only page-margin \"?\" where confused."),
+    ("2. BLANK-PAGE RECALL", "10 min", "Close the book. On a blank page, write everything "
+     "you remember — structure, numbers, exceptions. Then open the book and check. "
+     "The gaps found here are worth more than the reading itself "
+     "(Roediger & Karpicke 2006: testing beats re-study for retention, especially at a delay)."),
+    ("3. COMPRESS", "15 min", "One-page skeleton note in YOUR OWN words, telegraphic, tables "
+     "for comparisons. Hard rule: one page per chapter, maximum. If it doesn't fit, you "
+     "haven't compressed — you've copied (Mueller & Oppenheimer: generative processing is "
+     "what makes notes work). This page is the revision object forever; the book becomes "
+     "reference-only."),
+    ("4. RE-TEST", "10 min", "Same PYQs from Step 0 plus fresh ones. Log hours + topic in "
+     "the app. The Step-0-vs-Step-4 gap is the learning delta for the day."),
+    ("5. SPACED REVISITS", "scheduled", "D+1: 5-min recall from the skeleton page (not the "
+     "book). D+3: PYQs again. D+7/D+21/D+45: skeleton recall + a few PYQs. The app's "
+     "Revision tab schedules and flags these — obey the flags. Failed recall at D+7? The "
+     "topic re-enters at D+1 — that's the system working, not you failing."),
+]
+
+_INPUT_OUTPUT_RULE = (
+    "**Flip the input:output ratio.** Most aspirants spend ~90% of time on input "
+    "(reading/watching) and ~10% testing themselves. The literature says the split should "
+    "be closer to **50:50**. Retrieval is not \"checking\" learning — retrieval IS the "
+    "learning (Dunlosky et al. 2013, the definitive review of 10 learning techniques: "
+    "practice testing = HIGH utility, the strongest of all 10; re-reading and highlighting "
+    "= LOW utility, despite being the default habits of most students)."
+)
+
+_MODALITY_RULING = [
+    ("READ (book)", "Default for dense, testable material (Laxmikanth, Spectrum, NCERTs). "
+     "Self-paced — you can stop, question, recall. Highest fact-density per minute."),
+    ("VIDEO", "First-contact ONLY, for topics the book makes confusing (e.g. physical "
+     "geography processes, art & culture visuals). Rule: 1.5x speed, and it only earns its "
+     "time if followed IMMEDIATELY by 5 minutes of closed-book recall. Video without "
+     "retrieval is entertainment — it produces the strongest fluency illusion "
+     "(\"I understood it\" != \"I can produce it\")."),
+    ("AUDIO", "Revision-only channel — recorded CA summaries or your own note read-backs "
+     "during walks/chores. Never for first-time encoding of dense material."),
+    ("MAPS/DIAGRAMS", "Mandatory for geography (dual-coding: verbal + visual traces beat "
+     "either alone). Atlas open whenever geography is open."),
+]
+
+_SUBJECT_PHILOSOPHIES = [
+    ("Polity", "Precision + tables", "Laxmikanth is a precision subject — articles, "
+     "numbers, exceptions. Comparison tables (LS vs RS powers; ordinary vs money vs "
+     "constitutional amendment bills) beat prose summaries."),
+    ("History", "Calibrate depth by PYQs; timeline skeleton; Medieval = low priority",
+     "Build a timeline skeleton first, then hang detail off it. Depth per era should "
+     "track PYQ frequency, not personal interest — Medieval History is consistently "
+     "low-yield across the corpus."),
+    ("Geography", "Dual-coding / atlas", "Never study geography without the atlas open. "
+     "Physical processes encode better as diagrams than paragraphs — pair every map "
+     "feature with the verbal fact."),
+    ("Economy", "Mechanisms over facts", "Understand the mechanism (how does a repo rate "
+     "hike transmit to inflation) rather than memorising a number that will be stale "
+     "by exam day — mechanism questions recur, point-in-time statistics don't."),
+    ("Environment", "Lists / flashcards", "Heavily list-based (species, protected areas, "
+     "conventions, reports) — this is flashcard territory, not narrative-reading "
+     "territory. High PYQ-recurrence subject (see Concept Search — try \"Ramsar\")."),
+    ("Science", "PYQ-verify exemption", "Don't over-invest in first-principles science "
+     "study — verify against PYQs first; if a sub-area hasn't been asked in years, "
+     "a one-pass exemption is defensible."),
+    ("Current Affairs", "One source, 30-45 min cap", "Anudeep [PRIMARY]: \"one should "
+     "finish reading day's current affairs under 2 hours; 3-4 hours is overkill.\" One "
+     "compiled source, capped daily intake, revised repeatedly — never archived raw."),
+    ("Hindi / CSAT", "Daily reps", "Qualifying-only papers reward small daily reps over "
+     "occasional cramming — treat as a maintenance habit, not a study block."),
+]
+
+_TOPPER_NUMBERS = {
+    "Prelims mocks before prelims": [
+        "Shubham Kumar (AIR 1, 2020): 70-75 mock tests",
+        "Kanishak Kataria (AIR 1, 2018): 50+ mocks",
+        "Animesh Pradhan (AIR 2, 2023): 35-45 mocks",
+    ],
+    "Answer-writing volume": [
+        "2-8 answers/day across the corpus (Animesh: 2/day post-prelims; "
+        "Srushti: 3-4/day; Anu Kumari: 7-8/day for 4-5 months)",
+    ],
+    "Revision cycles": [
+        ">= 3 full revision cycles before the exam is CONVERGENT (10/23 toppers) — "
+        "Tina Dabi 3x, Anu Kumari 4-5x, Shubham Kumar 3 cycles, Animesh Pradhan 4 "
+        "iterations, Gamini Singla \"3 Rs\". Milestone-triggered, not calendar-triggered "
+        "— nobody in the corpus documents Anki/SRS-style fixed intervals.",
+    ],
+    "Named rules worth repeating": [
+        "Srushti Deshmukh: \"If you spend two hours taking a test, spend four hours "
+        "analysing it.\"",
+        "Tina Dabi: \"Reading ten books once is almost always less valuable than reading "
+        "two books five times.\"",
+        "Animesh Pradhan (working professional): 5-6 h/day with a full-time job, half-length "
+        "mains test every Sunday for 11 months, newspaper inside the 30-min lunch break, "
+        "no extended leave taken.",
+    ],
+}
+
+_SIX_TRAPS = [
+    ("Fluency illusion", "\"It looks familiar\" after re-reading/watching. Familiarity is "
+     "recognition; MCQs punish recognition without recall. Only retrieval tells the truth."),
+    ("Material collection", "New source = dopamine, zero retention. One source per subject, "
+     "revised many times — the #1 convergent topper habit in the corpus (12+/23)."),
+    ("Passive video bingeing", "Hours of lectures at 1x with no recall = entertainment with "
+     "a syllabus skin."),
+    ("Highlighting as studying", "A marked book is not a learned book."),
+    ("Postponing mocks \"until ready\"", "Readiness comes FROM testing, not before it."),
+    ("All-input days", "Any day with zero retrieval minutes was a reading day, not a study "
+     "day — the log should show the difference."),
+]
+
+
+def _render_method() -> None:
+    st.markdown("### 📖 Method — study protocol reference")
+    st.caption(
+        "Static reference, bundled into this module (not a file read) so it renders "
+        "identically in local and cloud mode. Source docs: STUDY_PROTOCOL.md + "
+        "cse_toppers_methods.md, reports/, 2026-07-31 — this tab is a frozen snapshot "
+        "and will not auto-update if those source docs are later revised."
+    )
+
+    st.markdown("#### The chapter protocol — 6-step checklist")
+    st.caption("Worked example basis: Laxmikanth, \"Parliament\". Total ~90 min + scheduled revisits.")
+    for step, duration, detail in _CHAPTER_PROTOCOL_STEPS:
+        with st.container(border=True):
+            st.markdown(f"**{step}** &nbsp;·&nbsp; *{duration}*")
+            st.write(detail)
+    _tier_caption(TIER_LITERATURE,
+                  "STUDY_PROTOCOL.md §3 — Kornell 2009 (pretesting), Roediger & Karpicke 2006 "
+                  "(testing effect), Mueller & Oppenheimer 2014 (generative note-taking), "
+                  "Rawson & Dunlosky 2011 (successive relearning)")
+
+    st.divider()
+    st.markdown("#### The input:output rule")
+    st.markdown(_INPUT_OUTPUT_RULE)
+    _tier_caption(TIER_LITERATURE, "STUDY_PROTOCOL.md §1 — Dunlosky et al. 2013, Psychological "
+                                    "Science in the Public Interest")
+
+    st.markdown("#### Read vs video vs audio — the ruling")
+    for modality, rule in _MODALITY_RULING:
+        st.markdown(f"- **{modality}** — {rule}")
+    _tier_caption(TIER_LITERATURE, "STUDY_PROTOCOL.md §2 — Ward et al. 2017 (phone-presence "
+                                    "attention drain) applies throughout: phone in another room")
+
+    st.divider()
+    st.markdown("#### Subject philosophies")
+    subj_df = pd.DataFrame(_SUBJECT_PHILOSOPHIES, columns=["Subject", "Philosophy", "Detail"])
+    st.dataframe(subj_df, use_container_width=True, hide_index=True)
+    _tier_caption(TIER_ESTIMATED, "STUDY_PROTOCOL.md + cse_toppers_methods.md synthesis — "
+                                   "per-subject calibration, not a single literature citation")
+
+    st.divider()
+    st.markdown("#### CSE topper numbers")
+    for label, items in _TOPPER_NUMBERS.items():
+        st.markdown(f"**{label}**")
+        for it in items:
+            st.markdown(f"- {it}")
+    _tier_caption(TIER_FREQUENCY,
+                  "cse_toppers_methods.md — frequency-ranked master table (§1) + §3/§5/§11, "
+                  "23-topper corpus, AIR 1-2015 through AIR 2-2024; CONVERGENT = 8+ toppers "
+                  "independently, COMMON = 3-7, ANECDOTE = 1-2")
+
+    st.divider()
+    st.markdown("#### Six traps (fluency illusion first)")
+    for i, (name, detail) in enumerate(_SIX_TRAPS, start=1):
+        st.markdown(f"**{i}. {name}** — {detail}")
+    _tier_caption(TIER_LITERATURE, "STUDY_PROTOCOL.md §5 — traps named directly from the "
+                                    "same technique-utility literature as the chapter protocol")
 
 
 # ---------------------------------------------------------------------------
