@@ -890,6 +890,17 @@ def check_auth():
 
 check_auth()
 
+# ---------------------------------------------------------------------------
+# Vault / Exam mode switch — Exam is a fully separate section (its own module,
+# its own JSON persistence under "New project/strategy/"). Never touches
+# wealth.db / Turso. Default stays Vault so nothing changes for normal use.
+# ---------------------------------------------------------------------------
+_app_mode = st.sidebar.radio("Mode", ["💰 Vault", "📚 Exam"], index=0, key="app_mode")
+if _app_mode == "📚 Exam":
+    import exam_strategy
+    exam_strategy.render()
+    st.stop()
+
 
 # ===========================================================================
 # HEADER + KPI ROW (shown above all tabs)
