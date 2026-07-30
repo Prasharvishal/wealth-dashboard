@@ -69,11 +69,13 @@ if LOCAL_MODE:
     BACKTEST_FILE = PROC / "backtest_g2_results.json"
     QBANK_REPAIRED = PROC / "question_bank_repaired.csv"
     QBANK_RECOVERED = PROC / "question_bank_recovered.csv"
+    QBANK_UPSC = PROC / "question_bank_upsc.csv"
     TAXONOMY_FILE = CONFIG / "topic_taxonomy_v2.json"
 else:
     BACKTEST_FILE = CLOUD_DATA / "backtest_g2_results.json"
     QBANK_REPAIRED = CLOUD_DATA / "question_bank_repaired.csv"
     QBANK_RECOVERED = CLOUD_DATA / "question_bank_recovered.csv"
+    QBANK_UPSC = CLOUD_DATA / "question_bank_upsc.csv"
     TAXONOMY_FILE = CLOUD_DATA / "topic_taxonomy_v2.json"
 
 # These have no cloud copies by design (§Finish note / task spec): the toppers
@@ -121,6 +123,7 @@ except Exception as exc:  # pragma: no cover - degrade gracefully
 MONTH_HOUR_TARGET = 180  # STRATEGY_CHARTER.md §7 — 180-200 h/month planned band
 UPPSC_PRELIMS_DATE = date(2026, 12, 6)
 K1_GATE_DATE = date(2027, 1, 31)
+CSE_2027_DECISION_GATE_DATE = date(2027, 1, 31)  # after UPPSC calibration (K1)
 
 TIER_CALCULATED = "CALCULATED"
 TIER_OFFICIAL = "OFFICIAL"
@@ -438,6 +441,13 @@ def load_question_bank() -> pd.DataFrame:
             df2 = pd.read_csv(QBANK_RECOVERED, dtype=str, keep_default_na=False)
             df2["_source_file"] = "recovered"
             frames.append(df2)
+        except Exception:
+            pass
+    if QBANK_UPSC.exists():
+        try:
+            df3 = pd.read_csv(QBANK_UPSC, dtype=str, keep_default_na=False)
+            df3["_source_file"] = "upsc"
+            frames.append(df3)
         except Exception:
             pass
     if not frames:
@@ -941,6 +951,8 @@ def _render_today(study_log: list[dict], today: date, error_log: list[dict] | No
               help=f"Target date {UPPSC_PRELIMS_DATE.isoformat()}")
     c2.metric("K1 calibration gate", f"{days_to_k1} days",
               help=f"STRATEGY_CHARTER.md K1 — {K1_GATE_DATE.isoformat()}")
+    st.caption(f"CSE 2027 decision gate: {CSE_2027_DECISION_GATE_DATE.strftime('%d %b %Y')} "
+               "(after UPPSC calibration)")
     _tier_caption(TIER_OFFICIAL, "dates fixed in STRATEGY_CHARTER.md / user's exam calendar")
 
     st.markdown("#### Study queue — top 5 right now")
@@ -984,7 +996,7 @@ def _render_today(study_log: list[dict], today: date, error_log: list[dict] | No
     with st.form("quick_log_form", clear_on_submit=True):
         fc1, fc2 = st.columns(2)
         log_date = fc1.date_input("Date", value=today)
-        exam = fc2.selectbox("Exam", ["UPPSC", "BPSC", "JPSC"])
+        exam = fc2.selectbox("Exam", ["UPPSC", "BPSC", "JPSC", "UPSC"])
         fc3, fc4 = st.columns(2)
         topic = fc3.selectbox("Topic", topics if topics else ["(taxonomy unavailable)"])
         hours = fc4.number_input("Hours", min_value=0.0, max_value=16.0, step=0.5, value=1.0)
@@ -1097,7 +1109,7 @@ def _render_priorities() -> None:
         _warn_missing(BACKTEST_FILE, "Backtest results")
         return
 
-    exam = st.selectbox("Exam", ["UPPSC", "BPSC", "JPSC"], key="priorities_exam")
+    exam = st.selectbox("Exam", ["UPPSC", "BPSC", "JPSC", "UPSC"], key="priorities_exam")
     rec = next((r for r in results if r.get("exam", "").upper() == exam.upper()), None)
     if not rec:
         st.warning(f"No G2 backtest record found for {exam}.")
@@ -1113,6 +1125,11 @@ def _render_priorities() -> None:
         st.success(
             "**JPSC: G2 PASS** but LEAVE-list blocked pending G3 cutoff data. "
             "Emphasis tiers below reflect the backtest keep-list; nothing is dropped."
+        )
+    elif exam.upper() == "UPSC":
+        st.success(
+            "**UPSC: G2 PASS** — 3 of 5 held-out years ≥70% strict coverage; "
+            "2026 paper 82.5%. Emphasis tiers validated."
         )
 
     tiers = emphasis_tier_map(exam)
@@ -1166,9 +1183,10 @@ def _render_question_bank(prefilter_topic: str | None = None) -> None:
         _warn_missing(QBANK_REPAIRED, "Question bank")
         return
 
-    st.caption(f"{len(df):,} questions loaded (repaired + recovered, deduplication not applied).")
-    _tier_caption(TIER_CALCULATED, "question_bank_repaired.csv + question_bank_recovered.csv; "
-                                    "recovered-file topics auto-classified on the fly with taxonomy v2")
+    st.caption(f"{len(df):,} questions loaded (repaired + recovered + upsc, deduplication not applied).")
+    _tier_caption(TIER_CALCULATED, "question_bank_repaired.csv + question_bank_recovered.csv + "
+                                    "question_bank_upsc.csv; recovered/upsc-file topics auto-classified "
+                                    "on the fly with taxonomy v2")
 
     n_hindi_paper = int(df["_hindi_paper"].sum())
 
@@ -1420,7 +1438,7 @@ def _render_revision(study_log: list[dict], today: date) -> None:
 # his mock-exam source — real past papers, not third-party recompilations.
 # ---------------------------------------------------------------------------
 _PAPER_FILENAME_RE = re.compile(
-    r"^(?P<exam>uppsc|bpsc|jpsc)_src_[0-9a-f]+_(?P<rest>.+)\.pdf$", re.IGNORECASE)
+    r"^(?P<exam>uppsc|bpsc|jpsc|upsc)_src_[0-9a-f]+_(?P<rest>.+)\.pdf$", re.IGNORECASE)
 _PAPER_YEAR_RE = re.compile(r"(20\d{2})")
 _PAPER_STAGE_RE = re.compile(r"\b(pre|prelim|mains|main)\b", re.IGNORECASE)
 
@@ -1459,8 +1477,8 @@ def _render_paper_library() -> None:
     st.markdown("#### 📄 Paper Library — harvested official papers")
     st.caption(
         "His mock-exam source: real past papers, not third-party recompilations. "
-        "Filtered to UPPSC-harvested files (uppsc_* filenames) plus any file with a "
-        "manifest row — see reports/uppsc_harvest_report.md for provenance."
+        "Filtered to UPPSC- and UPSC-harvested files (uppsc_* / upsc_* filenames) plus "
+        "any file with a manifest row — see reports/uppsc_harvest_report.md for provenance."
     )
 
     if not LOCAL_MODE:
@@ -1481,13 +1499,13 @@ def _render_paper_library() -> None:
         manifest_files = {Path(p).name for p in manifest["local_file"] if p}
 
     all_files = sorted(p.name for p in PDF_DIR.glob("*.pdf"))
-    uppsc_files = [f for f in all_files if f.lower().startswith("uppsc_")]
-    # union with any manifest-listed file not already caught by the uppsc_ prefix
+    uppsc_files = [f for f in all_files if f.lower().startswith(("uppsc_", "upsc_"))]
+    # union with any manifest-listed file not already caught by the uppsc_/upsc_ prefix
     extra_manifest_files = sorted(manifest_files - set(uppsc_files))
     shown_files = uppsc_files + [f for f in extra_manifest_files if (PDF_DIR / f).exists()]
 
     if not shown_files:
-        st.info("No UPPSC papers found in the local PDF corpus yet.")
+        st.info("No UPPSC/UPSC papers found in the local PDF corpus yet.")
         return
 
     rows = [_parse_paper_filename(f) for f in shown_files]
@@ -1812,7 +1830,7 @@ def _render_charter() -> None:
     with st.form("mock_score_form", clear_on_submit=True):
         c1, c2, c3, c4 = st.columns(4)
         m_date = c1.date_input("Date", value=date.today(), key="mock_date")
-        m_exam = c2.selectbox("Exam", ["UPPSC", "BPSC", "JPSC"], key="mock_exam")
+        m_exam = c2.selectbox("Exam", ["UPPSC", "BPSC", "JPSC", "UPSC"], key="mock_exam")
         m_score = c3.number_input("Score", min_value=0.0, step=0.5, key="mock_score")
         m_max = c4.number_input("Out of (max)", min_value=1.0, step=1.0, value=200.0, key="mock_max")
         st.markdown("**Questions I got wrong, by topic:**")

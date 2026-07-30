@@ -1,5 +1,88 @@
 [
  {
+  "exam": "UPSC",
+  "train_n": 548,
+  "train_years": [
+   "2014",
+   "2015",
+   "2016",
+   "2017",
+   "2018",
+   "2019",
+   "2020",
+   "2021"
+  ],
+  "years": {
+   "2022": {
+    "n": 50,
+    "strict_coverage_pct": 72.0,
+    "classified_coverage_pct": 81.8,
+    "unclassified_pct": 12.0,
+    "topic_share_kept_pct": 54.2,
+    "lift": 1.51,
+    "new_topics_not_in_train": []
+   },
+   "2023": {
+    "n": 91,
+    "strict_coverage_pct": 67.0,
+    "classified_coverage_pct": 80.3,
+    "unclassified_pct": 16.5,
+    "topic_share_kept_pct": 52.0,
+    "lift": 1.54,
+    "new_topics_not_in_train": [
+     "Awards and Honours"
+    ]
+   },
+   "2024": {
+    "n": 57,
+    "strict_coverage_pct": 64.9,
+    "classified_coverage_pct": 80.4,
+    "unclassified_pct": 19.3,
+    "topic_share_kept_pct": 54.2,
+    "lift": 1.48,
+    "new_topics_not_in_train": []
+   },
+   "2025": {
+    "n": 85,
+    "strict_coverage_pct": 71.8,
+    "classified_coverage_pct": 78.2,
+    "unclassified_pct": 8.2,
+    "topic_share_kept_pct": 54.2,
+    "lift": 1.44,
+    "new_topics_not_in_train": []
+   },
+   "2026": {
+    "n": 63,
+    "strict_coverage_pct": 82.5,
+    "classified_coverage_pct": 88.1,
+    "unclassified_pct": 6.3,
+    "topic_share_kept_pct": 54.2,
+    "lift": 1.63,
+    "new_topics_not_in_train": []
+   }
+  },
+  "train_unclassified_pct": 17.2,
+  "topics_total": 24,
+  "topics_kept": 13,
+  "keep_list": [
+   "Reasoning",
+   "Constitution",
+   "Physical Geography",
+   "Environment and Ecology",
+   "International Current Affairs",
+   "Ancient History",
+   "Union and State Government",
+   "Modern History",
+   "Art and Culture",
+   "General Science",
+   "Agriculture and Rural Economy",
+   "Macroeconomy",
+   "Technology"
+  ],
+  "years_passing_strict": 3,
+  "verdict": "PASS"
+ },
+ {
   "exam": "UPPSC",
   "train_n": 576,
   "train_years": [
