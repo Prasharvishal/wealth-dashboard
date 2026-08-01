@@ -82,11 +82,16 @@ else:
     TAXONOMY_V3_FILE = CLOUD_DATA / "topic_taxonomy_v3.json"
     ANSWER_KEY_FILE = CLOUD_DATA / "upsc_answer_keys.csv"
 
-# These have no cloud copies by design (§Finish note / task spec): the toppers
-# report, charter, and PDF corpus stay local-only. Cloud mode degrades them
-# gracefully (existing _warn_missing / dedicated messages), never crashes.
-TOPPERS_FILE = REPORTS / "toppers_evidence.md"
-CHARTER_FILE = BASE / "STRATEGY_CHARTER.md"
+# toppers_evidence.md and STRATEGY_CHARTER.md are bundled (small text files) —
+# two-tier like the taxonomy/qbank files above. The PDF corpus (PDF_DIR,
+# ~2.4GB) stays local-only by design: too large to commit, cloud mode
+# degrades it gracefully (dedicated message in _render_paper_library).
+if LOCAL_MODE:
+    TOPPERS_FILE = REPORTS / "toppers_evidence.md"
+    CHARTER_FILE = BASE / "STRATEGY_CHARTER.md"
+else:
+    TOPPERS_FILE = CLOUD_DATA / "toppers_evidence.md"
+    CHARTER_FILE = CLOUD_DATA / "STRATEGY_CHARTER.md"
 
 # Legacy JSON persistence — read-only now except for the one-time migration
 # into the DB tables below. Never written to going forward except as the
@@ -113,12 +118,14 @@ def data_source_caption() -> None:
     else:
         st.caption(f"☁️ Data source: **cloud mode** — reading bundled copies from `{CLOUD_DATA}`")
 
-# Import the real target_engine module (ported logic, not duplicated) —
-# strategy/ is a plain directory (no __init__.py), so add it to sys.path.
+# Import the real target_engine module (ported logic, not duplicated).
+# Two-tier: try the local "New project/strategy" copy first (kept in sync with
+# the research repo), else fall back to the plain module bundled into this
+# repo's root (target_engine.py, a verbatim copy) for cloud mode.
 _target_engine = None
 _target_engine_error = None
 try:
-    if str(STRATEGY_DIR) not in sys.path:
+    if LOCAL_MODE and str(STRATEGY_DIR) not in sys.path:
         sys.path.insert(0, str(STRATEGY_DIR))
     import target_engine as _target_engine  # noqa: E402
 except Exception as exc:  # pragma: no cover - degrade gracefully
@@ -1931,9 +1938,9 @@ def _render_paper_library() -> None:
 
     if not LOCAL_MODE:
         st.info(
-            "📄 Papers available in **local mode only** — the PDF corpus "
-            f"({PDF_DIR}) isn't bundled into this cloud deployment (too large / "
-            "copyright-sensitive to commit). Open this app on the Mac to download."
+            "📄 Papers are stored on the Mac (1.7GB) — use local mode for "
+            "downloads. All questions from these papers **are** in the "
+            "Question Bank here."
         )
         return
 
