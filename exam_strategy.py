@@ -71,12 +71,16 @@ if LOCAL_MODE:
     QBANK_RECOVERED = PROC / "question_bank_recovered.csv"
     QBANK_UPSC = PROC / "question_bank_upsc.csv"
     TAXONOMY_FILE = CONFIG / "topic_taxonomy_v2.json"
+    TAXONOMY_V3_FILE = CONFIG / "topic_taxonomy_v3.json"
+    ANSWER_KEY_FILE = PROC / "upsc_answer_keys.csv"
 else:
     BACKTEST_FILE = CLOUD_DATA / "backtest_g2_results.json"
     QBANK_REPAIRED = CLOUD_DATA / "question_bank_repaired.csv"
     QBANK_RECOVERED = CLOUD_DATA / "question_bank_recovered.csv"
     QBANK_UPSC = CLOUD_DATA / "question_bank_upsc.csv"
     TAXONOMY_FILE = CLOUD_DATA / "topic_taxonomy_v2.json"
+    TAXONOMY_V3_FILE = CLOUD_DATA / "topic_taxonomy_v3.json"
+    ANSWER_KEY_FILE = CLOUD_DATA / "upsc_answer_keys.csv"
 
 # These have no cloud copies by design (§Finish note / task spec): the toppers
 # report, charter, and PDF corpus stay local-only. Cloud mode degrades them
@@ -140,6 +144,27 @@ TIER_FREQUENCY = "FREQUENCY-COUNTED"
 # n<30").
 _TREND_MIN_N = 30
 
+# ---------------------------------------------------------------------------
+# Scored Practice Mode — alignment validation (audit finding U-2 fix).
+#
+# upsc_answer_keys.csv is keyed to booklet Series A. The harvested/parsed
+# question_bank_upsc.csv rows carry (year, question_number) but the booklet
+# series actually OCR'd for a given year is NOT independently confirmed — a
+# shuffled series would silently mis-key every answer. ALIGNED_YEARS below is
+# the outcome of a manual join-and-read validation pass (2026-08-01): for
+# 2014 / 2019 / 2023, join bank rows to key rows on (year, question_number),
+# then read 5 spread-out joined pairs per year and judge the keyed option
+# against general knowledge (e.g. "metal for EV batteries" -> Congo; "Congo
+# Basin" -> Cameroon). All 3 validated years cleared 5/5 (>=80% bar) despite
+# heavy OCR noise elsewhere in the same rows (garbled/merged option text) —
+# the (year, question_number) join key itself held up under inspection, so
+# Series A alignment is confirmed for these years. Only years actually
+# checked are listed; an unchecked year is NOT assumed aligned just because
+# the CSV has rows for it.
+ALIGNED_YEARS = ["2014", "2019", "2023"]
+NEGATIVE_MARK_FRACTION = 1.0 / 3.0  # UPSC prelims: -1/3 per wrong answer (OFFICIAL)
+SCORE_MAX_SCALE = 200.0  # UPSC prelims GS-I is scored out of 200
+
 
 def _tier_caption(tier: str, note: str = "") -> None:
     st.caption(f"Evidence tier: **{tier}**" + (f" — {note}" if note else ""))
@@ -194,6 +219,48 @@ def _stem_pattern(keyword: str):
 def build_classifier_rules():
     """[(subject, topic, [compiled patterns])] — ported from weightage_backtest.py."""
     tax = load_taxonomy()
+    rules = []
+    for subj in tax.get("subjects", []):
+        for t in subj.get("topics", []):
+            pats = [_stem_pattern(k) for k in t.get("keywords", []) if k.strip()]
+            if pats:
+                rules.append((subj["subject"], t["topic"], pats))
+    return rules
+
+
+# ---------------------------------------------------------------------------
+# Taxonomy v3 — Ask-tab classification ONLY (BUILD 3). Prelims Priorities /
+# Today / Charter emphasis tiers stay on the sealed v2 keep-list results per
+# task spec (do NOT recompute G2-validated tiers against a taxonomy that
+# wasn't the one the backtest ran against) — every other call site in this
+# file keeps calling load_taxonomy()/taxonomy_topics()/build_classifier_rules()
+# (v2, unchanged). Only _render_ask()'s three sub-tabs use the _v3 variants
+# below.
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def load_taxonomy_v3() -> dict:
+    if not TAXONOMY_V3_FILE.exists():
+        return {}
+    try:
+        return json.loads(TAXONOMY_V3_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def taxonomy_topics_v3() -> list[str]:
+    tax = load_taxonomy_v3()
+    topics = []
+    for subj in tax.get("subjects", []):
+        for t in subj.get("topics", []):
+            topics.append(t["topic"])
+    return topics
+
+
+@st.cache_resource(show_spinner=False)
+def build_classifier_rules_v3():
+    """v3 equivalent of build_classifier_rules() — same stem_pattern logic,
+    just sourced from topic_taxonomy_v3.json instead of v2."""
+    tax = load_taxonomy_v3()
     rules = []
     for subj in tax.get("subjects", []):
         for t in subj.get("topics", []):
@@ -490,6 +557,54 @@ def load_question_bank() -> pd.DataFrame:
     df["_low_quality"] = ~text_col.fillna("").apply(is_english_like)
     df["_hindi_paper"] = df["paper"].fillna("").apply(is_hindi_paper) if "paper" in df.columns else False
     return df
+
+
+# ---------------------------------------------------------------------------
+# Scored Practice Mode data layer — Series-A answer keys joined to the
+# question bank on (year, question_number). Only ALIGNED_YEARS are ever
+# exposed to the UI (see the ALIGNED_YEARS validation note above); this
+# loader itself makes no alignment judgement, it just reads the CSV.
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def load_answer_keys() -> pd.DataFrame:
+    if not ANSWER_KEY_FILE.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(ANSWER_KEY_FILE, dtype=str, keep_default_na=False)
+        df["question_number"] = df["question_number"].str.strip()
+        df["year"] = df["year"].str.strip()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(show_spinner=False)
+def scored_questions_for_year(year: str) -> pd.DataFrame:
+    """UPSC prelims question-bank rows for `year`, joined to the Series-A
+    answer key on (year, question_number). Only called for years in
+    ALIGNED_YEARS by the UI layer, but does the join for any year asked —
+    the ALIGNED_YEARS gate lives in the render function, not here."""
+    qb = load_question_bank()
+    keys = load_answer_keys()
+    if qb.empty or keys.empty:
+        return pd.DataFrame()
+    sub = qb[(qb["exam"].str.upper() == "UPSC")
+             & (qb["year"] == year)
+             & (qb["stage"].str.lower().str.contains("prelim", na=False))].copy()
+    if sub.empty:
+        return pd.DataFrame()
+    sub["question_number"] = sub["question_number"].astype(str).str.strip()
+    k = keys[keys["year"] == year][["question_number", "correct_option"]]
+    joined = sub.merge(k, on="question_number", how="inner")
+    # A handful of rows have a garbled correct_option value (OCR bleed in the
+    # source key row itself, e.g. a stray "X") — drop anything not in A-D so
+    # scoring never silently mis-grades against noise.
+    joined = joined[joined["correct_option"].isin(["A", "B", "C", "D"])]
+    # De-dup: some question_numbers repeat within a year's bank rows (merged
+    # OCR blocks create spurious duplicate rows) — keep the first per number
+    # so a sitting never shows the same question twice.
+    joined = joined.drop_duplicates(subset="question_number", keep="first")
+    return joined
 
 
 def load_toppers_md() -> str | None:
@@ -1004,6 +1119,17 @@ def _render_today(study_log: list[dict], today: date, error_log: list[dict] | No
     st.metric("Current streak", f"{streak} day{'s' if streak != 1 else ''}")
     _tier_caption(TIER_CALCULATED, "summed from the exam_study_log DB table")
 
+    st.markdown("#### Coverage")
+    st.metric("Priority topics started", _coverage_metric_label("UPPSC", study_log))
+    st.caption(
+        "% of DEEP + STANDARD topics (the G2 keep-list, both emphasis tiers) for the "
+        "primary exam with >= 1 'new study' log entry ever — audit finding G-17. "
+        "ONE-PASS topics are excluded from the denominator; this measures whether "
+        "the topics that matter most have been touched at all, not full-syllabus breadth."
+    )
+    _tier_caption(TIER_CALCULATED, "exam_study_log type='new study' rows vs emphasis_tier_map('UPPSC') "
+                                    "DEEP/STANDARD topics")
+
     st.markdown("#### Quick-log a session")
     topics = taxonomy_topics()
     with st.form("quick_log_form", clear_on_submit=True):
@@ -1013,7 +1139,8 @@ def _render_today(study_log: list[dict], today: date, error_log: list[dict] | No
         fc3, fc4 = st.columns(2)
         topic = fc3.selectbox("Topic", topics if topics else ["(taxonomy unavailable)"])
         hours = fc4.number_input("Hours", min_value=0.0, max_value=16.0, step=0.5, value=1.0)
-        study_type = st.selectbox("Type", ["new study", "revision", "PYQ practice", "mock"])
+        study_type = st.selectbox("Type", ["new study", "revision", "PYQ practice", "mock",
+                                            "mains_answer", "current_affairs"])
         note = st.text_input("Note (optional)")
         submitted = st.form_submit_button("Log session", use_container_width=True)
         if submitted:
@@ -1029,7 +1156,101 @@ def _render_today(study_log: list[dict], today: date, error_log: list[dict] | No
                 st.success(f"Logged {hours}h — {topic} ({study_type}) on {log_date.isoformat()}")
                 st.rerun()
 
+    _render_daily_loop_slots(study_log, today)
     _render_hindi_drill_tracker(study_log, today)
+
+
+# ---------------------------------------------------------------------------
+# Coverage metric (audit G-17) — % of DEEP+STANDARD (G2 keep-list) topics for
+# the primary exam with >= 1 'new study' log entry, ever.
+# ---------------------------------------------------------------------------
+def coverage_stats(exam: str, study_log: list[dict]) -> dict:
+    tiers = emphasis_tier_map(exam)
+    priority_topics = [t for t, tier in tiers.items() if tier in ("DEEP", "STANDARD")]
+    started_topics = {r.get("topic") for r in study_log if r.get("type") == "new study" and r.get("topic")}
+    n_started = sum(1 for t in priority_topics if t in started_topics)
+    n_total = len(priority_topics)
+    return {"n_started": n_started, "n_total": n_total,
+            "pct": round(100 * n_started / n_total, 1) if n_total else 0.0}
+
+
+def _coverage_metric_label(exam: str, study_log: list[dict]) -> str:
+    stats = coverage_stats(exam, study_log)
+    return f"{stats['n_started']} of {stats['n_total']} priority topics ({stats['pct']:.0f}%)"
+
+
+# ---------------------------------------------------------------------------
+# Daily loop slots (task BUILD 2) — two tracked daily items alongside the
+# Hindi drill: a mains answer (type='mains_answer') and CA reading
+# (type='current_affairs', 30-45 min target — separate from the existing
+# 12-month CA checklist in Resources, which logs whole-month coverage rather
+# than daily reading minutes; both write to type='current_affairs' rows but
+# are told apart by whether 'hours' looks like a whole-session read (this
+# tracker) or the checklist's 0-hour marker rows).
+# ---------------------------------------------------------------------------
+MAINS_ANSWER_DAILY_TARGET = 1
+CA_READING_TARGET_MIN = 30
+
+
+def _streak_for_type(study_log: list[dict], today: date, log_type: str) -> int:
+    days = {d for d in (_parse_date(r.get("date")) for r in study_log if r.get("type") == log_type) if d}
+    streak = 0
+    cursor = today
+    while cursor in days:
+        streak += 1
+        cursor -= timedelta(days=1)
+    return streak
+
+
+def _last_done_for_type(study_log: list[dict], log_type: str) -> date | None:
+    dates = [d for d in (_parse_date(r.get("date")) for r in study_log if r.get("type") == log_type) if d]
+    return max(dates) if dates else None
+
+
+def _render_daily_loop_slots(study_log: list[dict], today: date) -> None:
+    st.divider()
+    st.markdown("#### 📅 Daily loop — mains answer + CA reading")
+    st.caption(
+        "Two more tracked daily items, alongside the Hindi drill below: a mains-shape "
+        "answer (discuss/analyze/critically examine — logged as 'mains_answer') and "
+        f"CA reading ({CA_READING_TARGET_MIN}-45 min, logged as 'current_affairs')."
+    )
+
+    mains_streak = _streak_for_type(study_log, today, "mains_answer")
+    mains_last = _last_done_for_type(study_log, "mains_answer")
+    ca_streak = _streak_for_type(study_log, today, "current_affairs")
+    ca_last = _last_done_for_type(study_log, "current_affairs")
+
+    dc1, dc2 = st.columns(2)
+    with dc1:
+        st.markdown("**Mains answer (discuss shape)**")
+        st.metric("Streak", f"{mains_streak} day{'s' if mains_streak != 1 else ''}")
+        st.caption(f"Last done: {mains_last.isoformat() if mains_last else 'never'}")
+    with dc2:
+        st.markdown("**CA reading (30-45 min)**")
+        st.metric("Streak", f"{ca_streak} day{'s' if ca_streak != 1 else ''}")
+        st.caption(f"Last done: {ca_last.isoformat() if ca_last else 'never'}")
+    _tier_caption(TIER_CALCULATED, "type='mains_answer' / type='current_affairs' rows in exam_study_log "
+                                    "(quick-log form above — same DB table, no separate state)")
+
+    with st.form("daily_loop_form", clear_on_submit=True):
+        lc1, lc2, lc3 = st.columns(3)
+        loop_date = lc1.date_input("Date", value=today, key="loop_date")
+        loop_type = lc2.selectbox("Which slot", ["mains_answer", "current_affairs"], key="loop_type",
+                                   format_func=lambda t: "Mains answer" if t == "mains_answer" else "CA reading")
+        loop_minutes = lc3.number_input("Minutes", min_value=0, max_value=240, step=5,
+                                          value=45 if loop_type == "mains_answer" else CA_READING_TARGET_MIN,
+                                          key="loop_minutes")
+        loop_note = st.text_input("What did you cover? (optional)", key="loop_note")
+        loop_submit = st.form_submit_button("Log daily-loop item", use_container_width=True)
+        if loop_submit:
+            entry = {
+                "date": loop_date.isoformat(), "exam": "UPPSC", "topic": "General Studies",
+                "hours": round(loop_minutes / 60.0, 3), "type": loop_type, "note": loop_note,
+            }
+            if append_study_log(entry):
+                st.success(f"Logged {loop_minutes} min — {loop_type} on {loop_date.isoformat()}")
+                st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -1142,7 +1363,7 @@ def _render_priorities() -> None:
     elif exam.upper() == "UPSC":
         st.success(
             "**UPSC: G2 PASS** — 3 of 5 held-out years ≥70% strict coverage; "
-            "2026 paper 82.5%. Emphasis tiers validated."
+            "mean 71.7% across 5 held-out years (best 82.5%). Emphasis tiers validated."
         )
 
     tiers = emphasis_tier_map(exam)
@@ -1191,6 +1412,14 @@ def _render_priorities() -> None:
 # Tab 3 — Question Bank
 # ---------------------------------------------------------------------------
 def _render_question_bank(prefilter_topic: str | None = None) -> None:
+    sub_browse, sub_scored = st.tabs(["📝 Browse", "⏱️ Scored Sitting"])
+    with sub_browse:
+        _render_question_bank_browse(prefilter_topic=prefilter_topic)
+    with sub_scored:
+        _render_scored_sitting()
+
+
+def _render_question_bank_browse(prefilter_topic: str | None = None) -> None:
     df = load_question_bank()
     if df.empty:
         _warn_missing(QBANK_REPAIRED, "Question bank")
@@ -1304,6 +1533,206 @@ def _render_question_bank(prefilter_topic: str | None = None) -> None:
                         if opt:
                             st.write(f"**{lbl})** {opt}")
     st.caption(f"Page {page} of {n_pages} · {page_size}/page")
+
+
+# ---------------------------------------------------------------------------
+# Scored Sitting — the #1-ranked audit feature. Real UPSC prelims PYQs, timed,
+# graded with real -1/3 negative marking, scaled /200, per-topic accuracy,
+# wrong-topic auto-insert into exam_error_log so the Today priority queue
+# picks them up. ONLY years in ALIGNED_YEARS are selectable — see the
+# ALIGNED_YEARS validation note near the top of this file.
+# ---------------------------------------------------------------------------
+def _grade_sitting(answers: dict[str, str], joined: pd.DataFrame) -> dict:
+    """answers: {question_number: chosen_letter or None}. Returns a grading
+    summary dict — never mutates joined/answers."""
+    n_total = len(joined)
+    n_attempted = sum(1 for v in answers.values() if v)
+    n_correct = 0
+    n_wrong = 0
+    per_topic = {}  # topic -> [n_correct, n_attempted]
+    wrong_rows = []
+    for _, row in joined.iterrows():
+        qn = row["question_number"]
+        chosen = answers.get(qn)
+        topic = row.get("topic") or "UNCLASSIFIED"
+        per_topic.setdefault(topic, [0, 0])
+        if not chosen:
+            continue
+        per_topic[topic][1] += 1
+        if chosen == row["correct_option"]:
+            n_correct += 1
+            per_topic[topic][0] += 1
+        else:
+            n_wrong += 1
+            wrong_rows.append(topic)
+
+    raw_score = n_correct * 1.0 - n_wrong * NEGATIVE_MARK_FRACTION
+    # scale raw (2 marks/question standard UPSC GS-I weighting) to /200
+    marks_per_q = SCORE_MAX_SCALE / max(1, n_total)
+    scaled_score = raw_score * marks_per_q
+    scaled_max = n_total * marks_per_q
+
+    topic_rows = []
+    for topic, (correct, attempted) in sorted(per_topic.items()):
+        if attempted == 0:
+            continue
+        topic_rows.append({
+            "Topic": topic, "Attempted": attempted, "Correct": correct,
+            "Accuracy %": round(100 * correct / attempted, 1),
+        })
+
+    from collections import Counter
+    wrong_topic_counts = Counter(wrong_rows)
+
+    return {
+        "n_total": n_total, "n_attempted": n_attempted,
+        "n_correct": n_correct, "n_wrong": n_wrong,
+        "n_unattempted": n_total - n_attempted,
+        "raw_score": raw_score, "scaled_score": scaled_score, "scaled_max": scaled_max,
+        "topic_rows": topic_rows, "wrong_topic_counts": dict(wrong_topic_counts),
+    }
+
+
+def _render_scored_sitting() -> None:
+    st.markdown("#### ⏱️ Scored Sitting — real PYQs, real negative marking")
+    st.caption(
+        "PYQ sittings = practice; Charter gates read EXTERNAL mock scores only "
+        "(audit finding U-2). This tab grades against the real UPSC answer key "
+        "with -1/3 negative marking so you get an honest number, but it does "
+        "NOT feed the K1/K2 kill-line gates in the Charter tab — only an "
+        "external, cold, full-length mock can do that."
+    )
+
+    if not ALIGNED_YEARS:
+        st.warning("No years have passed alignment validation yet — Scored Sitting is unavailable.")
+        return
+
+    key_state_prefix = "scored_sitting_"
+    active = st.session_state.get(f"{key_state_prefix}active", False)
+
+    if not active:
+        c1, c2, c3 = st.columns(3)
+        year = c1.selectbox("Year (Series A, alignment-validated only)", ALIGNED_YEARS,
+                             key="scored_year")
+        joined_preview = scored_questions_for_year(year)
+        max_n = len(joined_preview)
+        default_n = min(20, max_n) if max_n else 0
+        n_questions = c2.number_input(
+            "N questions", min_value=1, max_value=max(1, max_n),
+            value=max(1, default_n), step=1, key="scored_n")
+        full_paper = c3.checkbox("Full paper", value=False, key="scored_full")
+        st.caption(f"{max_n} alignment-validated UPSC prelims questions available for {year}.")
+        _tier_caption(TIER_CALCULATED, "data/processed/upsc_answer_keys.csv joined to "
+                                        "question_bank_upsc.csv on (year, question_number); "
+                                        "only ALIGNED_YEARS shown")
+
+        if max_n == 0:
+            st.info("No joinable questions for this year — try another.")
+            return
+
+        if st.button("Start timed sitting", use_container_width=True, key="scored_start"):
+            n = max_n if full_paper else min(n_questions, max_n)
+            sample = joined_preview.sample(n=n, random_state=None).reset_index(drop=True)
+            st.session_state[f"{key_state_prefix}active"] = True
+            st.session_state[f"{key_state_prefix}year"] = year
+            st.session_state[f"{key_state_prefix}qnums"] = sample["question_number"].tolist()
+            st.session_state[f"{key_state_prefix}start_ts"] = datetime.now().isoformat(timespec="seconds")
+            st.session_state[f"{key_state_prefix}submitted"] = False
+            st.rerun()
+        return
+
+    # --- active sitting ---
+    year = st.session_state[f"{key_state_prefix}year"]
+    qnums = st.session_state[f"{key_state_prefix}qnums"]
+    joined = scored_questions_for_year(year)
+    joined = joined[joined["question_number"].isin(qnums)].copy()
+    joined["_order"] = joined["question_number"].apply(lambda q: qnums.index(q))
+    joined = joined.sort_values("_order")
+
+    start_ts = _parse_start_ts(st.session_state.get(f"{key_state_prefix}start_ts"))
+    elapsed = (datetime.now() - start_ts) if start_ts else timedelta(0)
+    st.metric("Elapsed", f"{int(elapsed.total_seconds() // 60)} min {int(elapsed.total_seconds() % 60)}s")
+
+    submitted_already = st.session_state.get(f"{key_state_prefix}submitted", False)
+
+    if not submitted_already:
+        with st.form("scored_sitting_form"):
+            answer_keys_widget = {}
+            for i, (_, row) in enumerate(joined.iterrows(), start=1):
+                qn = row["question_number"]
+                clean_stem, parsed_opts = clean_question_display(row.get("question_text", "") or "")
+                csv_opts = [_strip_garbage(_clean_option(row.get(c, "")))
+                            for c in ("option_a", "option_b", "option_c", "option_d")]
+                labels = ["A", "B", "C", "D"]
+                opts_for_radio = csv_opts if sum(1 for o in csv_opts if o) >= 2 else parsed_opts
+                st.markdown(f"**Q{i}.** {clean_stem or row.get('question_text', '')[:300]}")
+                radio_opts = [f"{lbl}) {opt}" for lbl, opt in zip(labels, opts_for_radio) if opt] or list(labels)
+                choice = st.radio("Your answer", ["(skip)"] + radio_opts,
+                                    key=f"scored_q_{qn}", label_visibility="collapsed")
+                answer_keys_widget[qn] = choice
+                st.divider()
+            do_submit = st.form_submit_button("Submit sitting", use_container_width=True)
+        if do_submit:
+            answers = {}
+            for qn, choice in answer_keys_widget.items():
+                if choice == "(skip)":
+                    answers[qn] = None
+                else:
+                    answers[qn] = choice[0]  # leading "A)"/"B)"/... letter
+            st.session_state[f"{key_state_prefix}answers"] = answers
+            st.session_state[f"{key_state_prefix}submitted"] = True
+            st.rerun()
+        return
+
+    # --- graded result ---
+    answers = st.session_state.get(f"{key_state_prefix}answers", {})
+    result = _grade_sitting(answers, joined)
+
+    st.success("Sitting graded.")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Score", f"{result['scaled_score']:.1f} / {result['scaled_max']:.0f}",
+               help="Scaled to a /200 UPSC GS-I equivalent")
+    m2.metric("Correct", result["n_correct"])
+    m3.metric("Wrong", result["n_wrong"])
+    m4.metric("Unattempted", result["n_unattempted"])
+    _tier_caption(TIER_CALCULATED, f"raw = correct - wrong x 1/3, scaled to /{SCORE_MAX_SCALE:g} "
+                                    f"by questions-in-sitting; N={result['n_total']} from "
+                                    f"{year} Series A (ALIGNED_YEARS)")
+
+    st.markdown("##### Per-topic accuracy")
+    if result["topic_rows"]:
+        st.dataframe(pd.DataFrame(result["topic_rows"]), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No questions attempted.")
+
+    if result["wrong_topic_counts"] and st.session_state.get(f"{key_state_prefix}logged") != True:
+        now = date.today().isoformat()
+        ok_all = True
+        for topic, cnt in result["wrong_topic_counts"].items():
+            ok_all = append_error_log({
+                "date": now, "exam": "UPSC", "topic": topic, "count": cnt,
+                "note": f"auto-inserted from Scored Sitting ({year}, N={result['n_total']})",
+            }) and ok_all
+        st.session_state[f"{key_state_prefix}logged"] = True
+        if ok_all:
+            st.caption(f"Wrong-question topics auto-inserted into exam_error_log "
+                       f"({len(result['wrong_topic_counts'])} topic rows) — these will now "
+                       "surface faster in the Today tab's priority queue.")
+
+    if st.button("Start another sitting", use_container_width=True, key="scored_reset"):
+        for k in list(st.session_state.keys()):
+            if k.startswith(key_state_prefix):
+                del st.session_state[k]
+        st.rerun()
+
+
+def _parse_start_ts(s) -> datetime | None:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1443,6 +1872,12 @@ def _render_revision(study_log: list[dict], today: date) -> None:
         "topic. Logging a 'revision' entry for that topic on/after a due date "
         "advances the schedule to the next stage."
     )
+    st.caption(
+        "Day-interval spacing was chosen deliberately over toppers' milestone-triggered "
+        "revision practice (their corpus reports counts like '3-4 full cycles', not fixed "
+        "calendar intervals) — spaced-repetition literature (Cepeda et al.) supports "
+        "expanding day-intervals for retention; documented audit finding U-7."
+    )
     _tier_caption(TIER_CALCULATED, "derived from the exam_study_log DB table — no separate state file")
 
 
@@ -1560,28 +1995,32 @@ def _render_paper_library() -> None:
 # v2) — nothing here writes to the DB or any file.
 # ---------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def _topic_year_counts(exam: str, topic: str) -> dict:
-    """{year(str): count} for one (exam, topic) pair, classifying on the fly
-    with the existing stem_pattern/classify pipeline (task spec) rather than
-    trusting only the bank-labelled `topic` column — a question bank-labelled
-    "" topic that would in fact classify to this topic still counts."""
+def _topic_year_counts(exam: str, topic: str, use_v3: bool = True) -> dict:
+    """{year(str): count} for one (exam, topic) pair. BUILD 3: the Ask tab now
+    classifies EVERY row fresh with taxonomy v3 (use_v3=True, the default and
+    only caller here) rather than reusing the bank's v2-derived `topic` column
+    for pre-labelled rows — v3 added a subject/topic vs v2, so trusting the
+    v2-labelled column would silently keep those rows on v2 tiers. Kept the
+    use_v3 flag (not a second copy of this function) so a future v2-explicit
+    caller doesn't have to reimplement the classify-on-the-fly logic below."""
     df = load_question_bank()
     if df.empty:
         return {}
     sub = df[df["exam"].str.upper() == exam.upper()].copy()
     if sub.empty:
         return {}
-    rules = build_classifier_rules()
     text_col = sub["question_text"] if "question_text" in sub.columns else pd.Series([""] * len(sub))
-    # Reuse the bank-labelled topic where present (bank-labelled rows are
-    # already the ground truth for `repaired`), else classify on the fly —
-    # mirrors load_question_bank()'s own needs_classify logic exactly, just
-    # scoped to this one topic so the whole bank isn't reclassified again here
-    # (build_classifier_rules/classify_text are cheap, but this keeps parity).
-    has_topic = sub["topic"].fillna("").str.strip().ne("")
-    computed_topic = sub["topic"].copy()
-    if (~has_topic).any():
-        computed_topic.loc[~has_topic] = text_col[~has_topic].apply(lambda t: classify_text(t, rules))
+    if use_v3:
+        rules = build_classifier_rules_v3()
+        computed_topic = text_col.apply(lambda t: classify_text(t, rules))
+    else:
+        # legacy v2 path: reuse the bank-labelled topic where present, else
+        # classify on the fly — mirrors load_question_bank()'s own logic.
+        rules = build_classifier_rules()
+        has_topic = sub["topic"].fillna("").str.strip().ne("")
+        computed_topic = sub["topic"].copy()
+        if (~has_topic).any():
+            computed_topic.loc[~has_topic] = text_col[~has_topic].apply(lambda t: classify_text(t, rules))
     match = computed_topic == topic
     years = sub.loc[match, "year"].fillna("").astype(str)
     years = years[years.str.strip() != ""]
@@ -1686,7 +2125,9 @@ def _render_ask() -> None:
     st.markdown("### 🔎 Ask — instant data answers")
     st.caption(
         "Everything on this tab is computed locally from the on-disk question bank, "
-        "the G2 backtest keep-lists, and taxonomy v2 — no LLM calls, no network. "
+        "the G2 backtest keep-lists, and **taxonomy v3** (BUILD 3 — this tab's topic "
+        "list/classification upgraded to v3; the Priorities/Today emphasis tiers stay "
+        "on the sealed v2 G2 backtest results, unchanged) — no LLM calls, no network. "
         "For strategy judgement (should I sacrifice this topic, is this book worth it), "
         "ask Claude in session — this tab only ever reports what the data says."
     )
@@ -1706,9 +2147,9 @@ def _render_ask() -> None:
 def _render_topic_explorer(preselect_exam: str | None = None,
                             preselect_topic: str | None = None) -> None:
     st.markdown("#### Topic Explorer")
-    topics = taxonomy_topics()
+    topics = taxonomy_topics_v3()
     if not topics:
-        _warn_missing(TAXONOMY_FILE, "Topic taxonomy v2")
+        _warn_missing(TAXONOMY_V3_FILE, "Topic taxonomy v3")
         return
 
     exam_options = ["UPSC", "UPPSC", "BPSC", "JPSC"]
@@ -1718,7 +2159,7 @@ def _render_topic_explorer(preselect_exam: str | None = None,
     topic_idx = topics.index(preselect_topic) if preselect_topic in topics else 0
     topic = c2.selectbox("Topic", topics, index=topic_idx, key="explorer_topic")
 
-    year_counts = _topic_year_counts(exam, topic)
+    year_counts = _topic_year_counts(exam, topic, use_v3=True)
     n_total = sum(year_counts.values())
 
     # (a) bar chart of question count per year
@@ -1731,9 +2172,12 @@ def _render_topic_explorer(preselect_exam: str | None = None,
         st.info(f"No questions classified to **{topic}** for {exam} in the loaded bank.")
     _tier_caption(TIER_CALCULATED,
                   "question_bank_{repaired,recovered,upsc}.csv, classified on the fly "
-                  "with taxonomy v2 stem-pattern rules (build_classifier_rules/classify_text)")
+                  "with taxonomy v3 stem-pattern rules (build_classifier_rules_v3/classify_text)")
 
-    # (b) emphasis tier + G2 coverage evidence line
+    # (b) emphasis tier + G2 coverage evidence line — DELIBERATELY still v2
+    # (emphasis_tier_map/taxonomy_topics): the sealed G2 backtest keep-list is
+    # a v2 artifact, never recomputed against v3 (task spec). A v3-only topic
+    # with no v2 match correctly falls through to ONE-PASS below.
     tiers = emphasis_tier_map(exam)
     tier = tiers.get(topic, "ONE-PASS")
     results = load_backtest_results()
@@ -1745,30 +2189,29 @@ def _render_topic_explorer(preselect_exam: str | None = None,
         st.caption(
             f"G2 keep-list evidence — {exam}: {rec.get('topics_kept', '?')}/"
             f"{rec.get('topics_total', '?')} topics kept; held-out years [{years_covered}] "
-            f"validate the keep-list (see Priorities tab for full per-year coverage)."
+            f"validate the keep-list (see Priorities tab for full per-year coverage). "
+            "Sealed v2 result — not recomputed against taxonomy v3."
         )
     else:
         st.caption(f"No G2 backtest record for {exam} — tier defaults to ONE-PASS.")
-    _tier_caption(TIER_CALCULATED, "exam_data/backtest_g2_results.json keep_list / years")
+    _tier_caption(TIER_CALCULATED, "exam_data/backtest_g2_results.json keep_list / years (v2, sealed)")
 
     # (c) trend caption, first-half vs second-half years, n-gated
     st.markdown(f"**{_trend_caption(year_counts)}**")
     _tier_caption(TIER_WEAK if n_total < _TREND_MIN_N else TIER_CALCULATED,
-                  f"n={n_total} questions classified to {topic} for {exam}; "
+                  f"n={n_total} questions classified to {topic} for {exam} (taxonomy v3); "
                   f"gate = {_TREND_MIN_N} per research-doctrine G1 (sub-sample-size "
                   f"trend claims are never gate-deciding)")
 
-    # (d) expander with that topic's questions, cleaned
+    # (d) expander with that topic's questions, cleaned — v3 classification,
+    # consistent with the v3 topic list this whole tab now selects from.
     with st.expander(f"Show {n_total} question(s) for {topic} · {exam}"):
         df = load_question_bank()
         if not df.empty:
-            rules = build_classifier_rules()
+            rules = build_classifier_rules_v3()
             sub = df[df["exam"].str.upper() == exam.upper()].copy()
             text_col = sub["question_text"] if "question_text" in sub.columns else pd.Series([""] * len(sub))
-            has_topic = sub["topic"].fillna("").str.strip().ne("")
-            computed_topic = sub["topic"].copy()
-            if (~has_topic).any():
-                computed_topic.loc[~has_topic] = text_col[~has_topic].apply(lambda t: classify_text(t, rules))
+            computed_topic = text_col.apply(lambda t: classify_text(t, rules))
             match_rows = sub[computed_topic == topic]
             if match_rows.empty:
                 st.caption("Nothing to show.")
@@ -1849,7 +2292,7 @@ def _render_quick_router() -> None:
     if not query.strip():
         return
 
-    topics = taxonomy_topics()
+    topics = taxonomy_topics_v3()  # BUILD 3 — Ask-tab routing targets v3 topics
     q = query.strip()
 
     m = _ROUTE_WEIGHTAGE_RE.search(q) or _ROUTE_TREND_RE.search(q)
@@ -2056,6 +2499,12 @@ def _render_method() -> None:
 
     st.divider()
     st.markdown("#### CSE topper numbers")
+    st.warning(
+        "**Topper numbers are survivorship-bounded — treat as sanity bounds, not causal "
+        "targets.** This corpus is 23 people who passed; it says nothing about the mocks "
+        "count of everyone who attempted the same volume and didn't clear it. 35-75 mocks "
+        "is a normal range seen here, not a number to hit for its own sake."
+    )
     for label, items in _TOPPER_NUMBERS.items():
         st.markdown(f"**{label}**")
         for it in items:
